@@ -1,0 +1,31 @@
+# Node modules and logs
+node_modules
+npm-debug.log
+yarn-error.log
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Git
+.git
+.gitignore
+
+# Environment and credentials
+.env
+*.pem
+*.key
+*.crt
+
+# VSCode or IDE configs
+.vscode
+.idea
+
+# Dockerfiles and config backups
+Dockerfile.*
+docker-compose.*
+
+# Tests or docs if not needed in container
+tests
+__tests__
+docs
