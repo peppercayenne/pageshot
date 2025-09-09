@@ -1,29 +1,28 @@
 // index.js
 // Express + Playwright + Gemini OCR
-// Scrapes Amazon product data with DOM + OCR
+// Scrapes Amazon product info via DOM + Gemini OCR on screenshot
 //
 // GET /scrape?url=...
-//
-// Env:
-//   PORT=8080
-//   GEMINI_API_KEY=your_gemini_api_key
 
 import express from "express";
 import { chromium } from "playwright";
-import dotenv from "dotenv";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Gemini setup
+// Gemini client
+if (!process.env.GEMINI_API_KEY) {
+  console.error("❌ Missing GEMINI_API_KEY in environment");
+  process.exit(1);
+}
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-// ---------- minimal context ----------
-async function minimalContext(chromium, width, height) {
+/**
+ * Minimal Playwright context
+ */
+async function minimalContext(width, height) {
   const browser = await chromium.launch({
     headless: true,
     args: [
@@ -32,7 +31,6 @@ async function minimalContext(chromium, width, height) {
       "--disable-blink-features=AutomationControlled",
       "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--single-process",
     ],
   });
 
@@ -45,234 +43,151 @@ async function minimalContext(chromium, width, height) {
   });
 
   const page = await context.newPage();
+
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
   });
+
   await page.setExtraHTTPHeaders({
     "accept-language": "en-US,en;q=0.9",
   });
 
-  return { browser, context, page };
+  return { browser, page };
 }
 
-async function isVisible(pageOrFrame, selector) {
-  const el = await pageOrFrame.$(selector);
-  if (!el) return false;
-  return el.isVisible();
-}
-
-async function detectCase(page) {
-  const html = await page.content();
-  const is503 = /503 - Service Unavailable/i.test(html);
-  const is504 = /504 - Gateway Time-out/i.test(html);
-
-  const titleVisible = await isVisible(page, "#productTitle");
-  if (titleVisible) {
-    return { type: "normal", signals: { titleVisible: true } };
-  }
-
-  if (is503) return { type: "error", errorType: "503", signals: { is503 } };
-  if (is504) return { type: "error", errorType: "504", signals: { is504 } };
-
-  return { type: "normal", signals: { fallbackNormal: true } };
-}
-
-async function getTitle(page) {
+/**
+ * Scrape product data from DOM
+ */
+async function scrapeProductData(page) {
   const title =
     (await page.textContent("#productTitle").catch(() => null)) ||
-    (await page.textContent("#title").catch(() => null)) ||
-    (await page.evaluate(() => {
-      const el = document.querySelector('meta[property="og:title"]');
-      return el ? el.getAttribute("content") : null;
-    }).catch(() => null)) ||
-    (await page.title().catch(() => null));
-  return (title || "").trim();
-}
+    (await page.textContent("#title").catch(() => null));
 
-async function scrapeProductData(page) {
-  return await page.evaluate(() => {
+  return await page.evaluate((title) => {
     const text = (sel) => {
       const el = document.querySelector(sel);
       return el ? (el.textContent || "").trim() : "";
     };
 
     const brand = (() => {
-      const tr = document.querySelector("tr.a-spacing-small.po-brand");
-      if (tr) {
-        const tds = tr.querySelectorAll("td");
-        if (tds[1]) return (tds[1].textContent || "").trim();
-      }
       const byline = document.querySelector("#bylineInfo");
-      if (byline) return (byline.textContent || "").trim();
+      if (byline) return byline.textContent.trim();
       return "";
     })();
 
     const itemForm = (() => {
-      const tr = document.querySelector("tr.a-spacing-small.po-item_form");
-      if (tr) {
-        const tds = tr.querySelectorAll("td");
-        if (tds[1]) return (tds[1].textContent || "").trim();
+      const li = Array.from(document.querySelectorAll("li")).find((el) =>
+        (el.textContent || "").toLowerCase().includes("item form")
+      );
+      if (li) {
+        const parts = (li.textContent || "").split(":");
+        if (parts.length > 1) return parts.slice(1).join(":").trim();
       }
       return "";
     })();
 
     let price = "";
-    try {
-      const candidates = Array.from(
-        document.querySelectorAll(".a-price .a-offscreen")
-      )
-        .map((el) => (el.textContent || "").trim())
-        .filter((t) => /^\$?\d/.test(t));
-      if (candidates.length) {
-        price = candidates[0];
-      }
-    } catch {}
-    if (!price) {
-      price =
-        text("#priceblock_ourprice") ||
-        text("#priceblock_dealprice") ||
-        text("#price_inside_buybox") ||
-        "";
+    const candidates = Array.from(
+      document.querySelectorAll(".a-price .a-offscreen")
+    )
+      .map((el) => (el.textContent || "").trim())
+      .filter((t) => /^\$?\d/.test(t));
+    if (candidates.length) {
+      price = candidates[0];
     }
 
     const mainImageUrl = (() => {
-      const landing = document.querySelector("#landingImage");
-      if (landing) {
-        return (
-          landing.getAttribute("data-old-hires") ||
-          landing.getAttribute("src") ||
-          ""
-        );
-      }
+      const imgTag = document.querySelector("#imgTagWrapperId img");
+      if (imgTag) return imgTag.getAttribute("src") || "";
       return "";
     })();
 
     return {
-      brand: (brand || "").replace(/\s+/g, " ").trim(),
-      itemForm: (itemForm || "").replace(/\s+/g, " ").trim(),
-      price: (price || "").replace(/\s+/g, " ").trim(),
-      mainImageUrl: (mainImageUrl || "").trim(),
+      title: (title || "").trim(),
+      brand: brand.trim(),
+      itemForm: itemForm.trim(),
+      price: (price || "").trim(),
+      mainImageUrl: mainImageUrl.trim(),
     };
-  });
+  }, title);
 }
 
-// ---------- endpoints ----------
-app.get("/", (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
-});
-
-app.get("/scrape", async (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
-  const url = req.query.url;
-  if (!url) return res.status(400).json({ ok: false, error: "Missing url parameter" });
-
-  const width = 1280, height = 800;
-  const traceId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  res.set("x-trace-id", traceId);
-
-  let browser;
-  try {
-    const { browser: br, page } = await minimalContext(chromium, width, height);
-    browser = br;
-
-    const navResp = await page.goto(url, {
-      timeout: 60000,
-      waitUntil: "domcontentloaded",
-    });
-    const httpStatus = navResp?.status?.() ?? null;
-
-    const detected = await detectCase(page);
-
-    if (detected.type === "error") {
-      const buf = await page.screenshot({ type: "png" });
-      await browser.close();
-      return res.json({
-        ok: false,
-        _traceId: traceId,
-        url,
-        httpStatus,
-        case: "error",
-        errorType: detected.errorType,
-        detectorSignals: detected.signals || {},
-        base64: buf.toString("base64"),
-      });
-    }
-
-    const [title, pdata] = await Promise.all([
-      getTitle(page),
-      scrapeProductData(page),
-    ]);
-    const buf = await page.screenshot({ type: "png" });
-    const base64Image = buf.toString("base64");
-
-    // ---------- Gemini OCR step ----------
-    const prompt = `
+/**
+ * Gemini OCR extraction
+ */
+async function geminiExtract(base64Image) {
+  const prompt = `
 You are given a screenshot of an Amazon product page.
-Extract JSON with fields:
+Extract JSON with:
 - title
 - brand
 - itemForm
 - price
-Return ONLY valid JSON.
-`;
+Return ONLY valid JSON.`;
 
-    let geminiJson = { error: "Gemini not called" };
-    try {
-      const result = await model.generateContent([
-        { text: prompt },
-        { inlineData: { mimeType: "image/png", data: base64Image } },
-      ]);
+  const result = await model.generateContent([
+    { text: prompt },
+    { inlineData: { mimeType: "image/png", data: base64Image } },
+  ]);
 
-      let geminiText = result.response.text().trim();
-      geminiText = geminiText
-        .replace(/^```(?:json)?\s*/i, "")
-        .replace(/```$/i, "")
-        .trim();
+  let text = result.response.text().trim();
+  text = text.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
 
-      try {
-        geminiJson = JSON.parse(geminiText);
-      } catch (e) {
-        geminiJson = { error: "Failed to parse Gemini output", raw: geminiText };
-      }
-    } catch (e) {
-      geminiJson = { error: "Gemini call failed", message: e.message };
-    }
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { error: "Failed to parse Gemini output", raw: text };
+  }
+}
+
+// ---------- endpoints ----------
+app.get("/", (req, res) => {
+  res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
+});
+
+app.get("/scrape", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
+
+  const width = 1280, height = 800;
+  let browser;
+  try {
+    const { browser: br, page } = await minimalContext(width, height);
+    browser = br;
+
+    await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(1000);
+
+    // Scraping
+    const scraped = await scrapeProductData(page);
+
+    // Screenshot for OCR
+    const buf = await page.screenshot({ type: "png" });
+    const base64 = buf.toString("base64");
+
+    // Gemini OCR
+    const geminiData = await geminiExtract(base64);
 
     await browser.close();
-
-    return res.json({
+    res.json({
       ok: true,
-      _traceId: traceId,
       url,
-      case: "normal",
-      playwrightData: {
-        title,
-        brand: pdata.brand || "",
-        itemForm: pdata.itemForm || "",
-        price: pdata.price || "",
-        mainImageUrl: pdata.mainImageUrl || "",
-      },
-      geminiData: geminiJson,
-      detectorSignals: detected.signals || {},
-      base64: base64Image,
+      scrapedData: scraped,
+      geminiOCR: geminiData,
+      screenshot: base64,
     });
   } catch (err) {
     try {
       await browser?.close();
     } catch {}
-    return res.status(500).json({
+    res.status(500).json({
       ok: false,
-      _traceId: traceId,
-      url,
-      case: "error",
-      errorType: "exception",
       error: err.message || String(err),
     });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Scraper + Gemini OCR API running on port ${PORT}`);
+// Start server
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Running on port ${PORT}`);
 });
