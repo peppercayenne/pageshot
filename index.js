@@ -8,10 +8,10 @@
 //   PORT=8080
 //   GEMINI_API_KEY=your_gemini_api_key
 
-const express = require("express");
-const { chromium } = require("playwright");
-const dotenv = require("dotenv");
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+import express from "express";
+import { chromium } from "playwright";
+import dotenv from "dotenv";
+import { GoogleGenerativeAI } from "@google/generative-ai";
 
 dotenv.config();
 
@@ -62,9 +62,7 @@ async function isVisible(pageOrFrame, selector) {
 }
 
 async function detectCase(page) {
-  const url = page.url();
   const html = await page.content();
-
   const is503 = /503 - Service Unavailable/i.test(html);
   const is504 = /504 - Gateway Time-out/i.test(html);
 
