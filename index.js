@@ -151,12 +151,41 @@ app.get("/scrape", async (req, res) => {
 
   const width = 1280, height = 800;
   let browser;
+
+  let continueShoppingClicks = 0;
+  let reloads = 0;
+
   try {
     const { browser: br, page } = await minimalContext(width, height);
     browser = br;
 
     await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
     await page.waitForTimeout(1000);
+
+    // Handle "Continue Shopping" loop
+    while (continueShoppingClicks < 10) {
+      const button = await page.$("text=Continue shopping");
+      if (button) {
+        continueShoppingClicks++;
+        reloads++;
+        console.log(`⚠️ 'Continue shopping' detected, clicking (${continueShoppingClicks})...`);
+        await button.click();
+        await page.waitForLoadState("domcontentloaded", { timeout: 30000 });
+        await page.waitForTimeout(1000);
+      } else {
+        break;
+      }
+    }
+
+    if (continueShoppingClicks >= 10) {
+      await browser.close();
+      return res.status(429).json({
+        ok: false,
+        error: "Exceeded max Continue Shopping attempts",
+        continueShoppingClicks,
+        reloads,
+      });
+    }
 
     // Scraping
     const scraped = await scrapeProductData(page);
@@ -172,6 +201,8 @@ app.get("/scrape", async (req, res) => {
     res.json({
       ok: true,
       url,
+      continueShoppingClicks,
+      reloads,
       scrapedData: scraped,
       geminiOCR: geminiData,
       screenshot: base64,
@@ -183,6 +214,8 @@ app.get("/scrape", async (req, res) => {
     res.status(500).json({
       ok: false,
       error: err.message || String(err),
+      continueShoppingClicks,
+      reloads,
     });
   }
 });
