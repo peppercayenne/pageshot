@@ -66,8 +66,7 @@ async function scrapeProductData(page) {
   return await page.evaluate((title) => {
     const brand = (() => {
       const byline = document.querySelector("#bylineInfo");
-      if (byline) return byline.textContent.trim();
-      return "";
+      return byline ? byline.textContent.trim() : "";
     })();
 
     const itemForm = (() => {
@@ -91,41 +90,62 @@ async function scrapeProductData(page) {
       price = candidates[0];
     }
 
-    const mainImageUrl = (() => {
-      const imgTag = document.querySelector("#imgTagWrapperId img");
-      if (imgTag) return imgTag.getAttribute("src") || "";
-      return "";
-    })();
+    // Main image
+    const mainImageEl = document.querySelector("#imgTagWrapperId img");
+    let mainImageUrl = "";
+    if (mainImageEl) {
+      const data = mainImageEl.getAttribute("data-a-dynamic-image");
+      if (data) {
+        try {
+          const parsed = JSON.parse(data);
+          // Pick the largest resolution
+          mainImageUrl = Object.keys(parsed).sort(
+            (a, b) => parsed[b][0] * parsed[b][1] - parsed[a][0] * parsed[a][1]
+          )[0];
+        } catch {}
+      }
+      if (!mainImageUrl) mainImageUrl = mainImageEl.src || "";
+    }
 
-    // Normalize thumbnail -> full-size
-    const normalizeImageUrl = (url) => {
-      if (!url) return "";
-      return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
-    };
-
-    const normalizedMain = normalizeImageUrl(mainImageUrl.trim());
-
-    let additionalImageUrls = Array.from(
-      document.querySelectorAll("#altImages img, .imageThumb img")
-    )
-      .map((img) => img.getAttribute("src") || "")
-      .map((src) => normalizeImageUrl(src))
-      .filter((src) => {
-        if (!src) return false;
-        const lower = src.toLowerCase();
-        return !(
-          lower.includes("sprite") ||
-          lower.includes("360_icon") ||
-          lower.includes("play-icon") ||
-          lower.includes("overlay") ||
-          lower.includes("fmjpg") ||
-          lower.includes("fmpng")
-        );
+    // Additional hi-res images
+    let additionalImageUrls = [];
+    const imageBlock = document.getElementById("imageBlockATF");
+    if (imageBlock) {
+      const scripts = imageBlock.querySelectorAll("script");
+      scripts.forEach((s) => {
+        const text = s.textContent || "";
+        if (text.includes("colorImages")) {
+          try {
+            const match = text.match(/"colorImages"\s*:\s*{[\s\S]*?}\s*,/);
+            if (match) {
+              const jsonText = "{" + match[0].slice(0, -1) + "}";
+              const parsed = JSON.parse(jsonText);
+              if (parsed.colorImages && parsed.colorImages.initial) {
+                additionalImageUrls = parsed.colorImages.initial
+                  .map((img) => img.hiRes || img.large || img.mainUrl)
+                  .filter(Boolean);
+              }
+            }
+          } catch {}
+        }
       });
+    }
 
-    // Deduplicate: remove mainImageUrl and duplicates
+    // Fallback: check thumbnails if JSON not found
+    if (!additionalImageUrls.length) {
+      additionalImageUrls = Array.from(
+        document.querySelectorAll("#altImages img, .imageThumb img")
+      )
+        .map((img) => img.src || "")
+        .map((src) =>
+          src.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg")
+        )
+        .filter(Boolean);
+    }
+
+    // Deduplicate + exclude main image
     additionalImageUrls = [...new Set(additionalImageUrls)].filter(
-      (url) => url !== normalizedMain
+      (url) => url && url !== mainImageUrl
     );
 
     return {
@@ -133,7 +153,7 @@ async function scrapeProductData(page) {
       brand: brand.trim(),
       itemForm: itemForm.trim(),
       price: (price || "").trim(),
-      mainImageUrl: normalizedMain,
+      mainImageUrl: mainImageUrl.trim(),
       additionalImageUrls,
     };
   }, title);
