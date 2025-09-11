@@ -97,7 +97,7 @@ async function scrapeProductData(page) {
       return "";
     })();
 
-    // Normalize thumbnail -> full-size by removing size tokens like ._SS40_, ._AC_US40_, etc.
+    // Normalize thumbnail -> full-size
     const normalizeImageUrl = (url) => {
       if (!url) return "";
       return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
@@ -109,8 +109,19 @@ async function scrapeProductData(page) {
       document.querySelectorAll("#altImages img, .imageThumb img")
     )
       .map((img) => img.getAttribute("src") || "")
-      .filter((src) => src && !src.includes("sprite"))
-      .map((src) => normalizeImageUrl(src));
+      .map((src) => normalizeImageUrl(src))
+      .filter((src) => {
+        if (!src) return false;
+        const lower = src.toLowerCase();
+        return !(
+          lower.includes("sprite") ||
+          lower.includes("360_icon") ||
+          lower.includes("play-icon") ||
+          lower.includes("overlay") ||
+          lower.includes("fmjpg") ||
+          lower.includes("fmpng")
+        );
+      });
 
     // Deduplicate: remove mainImageUrl and duplicates
     additionalImageUrls = [...new Set(additionalImageUrls)].filter(
