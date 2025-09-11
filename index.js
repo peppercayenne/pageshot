@@ -69,109 +69,105 @@ async function scrapeProductData(page) {
     (await page.textContent("#productTitle").catch(() => null)) ||
     (await page.textContent("#title").catch(() => null));
 
-  return await page.evaluate(
-    (title, toHiResStr) => {
-      const toHiRes = new Function("url", `return (${toHiResStr})(url);`);
+  return await page.evaluate(({ title, toHiResStr }) => {
+    const toHiRes = new Function("url", `return (${toHiResStr})(url);`);
 
-      const brand = (() => {
-        const byline = document.querySelector("#bylineInfo");
-        return byline ? byline.textContent.trim() : "";
-      })();
+    const brand = (() => {
+      const byline = document.querySelector("#bylineInfo");
+      return byline ? byline.textContent.trim() : "";
+    })();
 
-      const itemForm = (() => {
-        const li = Array.from(document.querySelectorAll("li")).find((el) =>
-          (el.textContent || "").toLowerCase().includes("item form")
-        );
-        if (li) {
-          const parts = (li.textContent || "").split(":");
-          if (parts.length > 1) return parts.slice(1).join(":").trim();
-        }
-        return "";
-      })();
-
-      let price = "";
-      const candidates = Array.from(
-        document.querySelectorAll(".a-price .a-offscreen")
-      )
-        .map((el) => (el.textContent || "").trim())
-        .filter((t) => /^\$?\d/.test(t));
-      if (candidates.length) {
-        price = candidates[0];
+    const itemForm = (() => {
+      const li = Array.from(document.querySelectorAll("li")).find((el) =>
+        (el.textContent || "").toLowerCase().includes("item form")
+      );
+      if (li) {
+        const parts = (li.textContent || "").split(":");
+        if (parts.length > 1) return parts.slice(1).join(":").trim();
       }
+      return "";
+    })();
 
-      // Main image
-      const mainImageEl = document.querySelector("#imgTagWrapperId img");
-      let mainImageUrl = "";
-      if (mainImageEl) {
-        const data = mainImageEl.getAttribute("data-a-dynamic-image");
-        if (data) {
+    let price = "";
+    const candidates = Array.from(
+      document.querySelectorAll(".a-price .a-offscreen")
+    )
+      .map((el) => (el.textContent || "").trim())
+      .filter((t) => /^\$?\d/.test(t));
+    if (candidates.length) {
+      price = candidates[0];
+    }
+
+    // Main image
+    const mainImageEl = document.querySelector("#imgTagWrapperId img");
+    let mainImageUrl = "";
+    if (mainImageEl) {
+      const data = mainImageEl.getAttribute("data-a-dynamic-image");
+      if (data) {
+        try {
+          const parsed = JSON.parse(data);
+          mainImageUrl = Object.keys(parsed).sort(
+            (a, b) =>
+              parsed[b][0] * parsed[b][1] - parsed[a][0] * parsed[a][1]
+          )[0];
+        } catch {}
+      }
+      if (!mainImageUrl) mainImageUrl = mainImageEl.src || "";
+    }
+    mainImageUrl = toHiRes(mainImageUrl);
+
+    // Additional images
+    let additionalImageUrls = [];
+    const imageBlock = document.getElementById("imageBlockATF");
+    if (imageBlock) {
+      const scripts = imageBlock.querySelectorAll("script");
+      scripts.forEach((s) => {
+        const text = s.textContent || "";
+        if (text.includes("colorImages")) {
           try {
-            const parsed = JSON.parse(data);
-            mainImageUrl = Object.keys(parsed).sort(
-              (a, b) =>
-                parsed[b][0] * parsed[b][1] - parsed[a][0] * parsed[a][1]
-            )[0];
+            const match = text.match(/"colorImages"\s*:\s*{[\s\S]*?}\s*,/);
+            if (match) {
+              const jsonText = "{" + match[0].slice(0, -1) + "}";
+              const parsed = JSON.parse(jsonText);
+              if (parsed.colorImages && parsed.colorImages.initial) {
+                additionalImageUrls = parsed.colorImages.initial
+                  .map((img) => img.hiRes || img.large || img.mainUrl)
+                  .filter(Boolean);
+              }
+            }
           } catch {}
         }
-        if (!mainImageUrl) mainImageUrl = mainImageEl.src || "";
-      }
-      mainImageUrl = toHiRes(mainImageUrl);
+      });
+    }
 
-      // Additional images
-      let additionalImageUrls = [];
-      const imageBlock = document.getElementById("imageBlockATF");
-      if (imageBlock) {
-        const scripts = imageBlock.querySelectorAll("script");
-        scripts.forEach((s) => {
-          const text = s.textContent || "";
-          if (text.includes("colorImages")) {
-            try {
-              const match = text.match(/"colorImages"\s*:\s*{[\s\S]*?}\s*,/);
-              if (match) {
-                const jsonText = "{" + match[0].slice(0, -1) + "}";
-                const parsed = JSON.parse(jsonText);
-                if (parsed.colorImages && parsed.colorImages.initial) {
-                  additionalImageUrls = parsed.colorImages.initial
-                    .map((img) => img.hiRes || img.large || img.mainUrl)
-                    .filter(Boolean);
-                }
-              }
-            } catch {}
-          }
-        });
-      }
+    if (!additionalImageUrls.length) {
+      additionalImageUrls = Array.from(
+        document.querySelectorAll("#altImages img, .imageThumb img")
+      )
+        .map((img) => img.src || "")
+        .filter(Boolean);
+    }
 
-      if (!additionalImageUrls.length) {
-        additionalImageUrls = Array.from(
-          document.querySelectorAll("#altImages img, .imageThumb img")
-        )
-          .map((img) => img.src || "")
-          .filter(Boolean);
-      }
+    // Deduplicate and normalize to hi-res
+    additionalImageUrls = [...new Set(additionalImageUrls)]
+      .map(toHiRes)
+      .filter(
+        (url) =>
+          url &&
+          url !== mainImageUrl &&
+          !url.includes("icon") &&
+          !url.includes("overlay")
+      );
 
-      // Deduplicate and normalize to hi-res
-      additionalImageUrls = [...new Set(additionalImageUrls)]
-        .map(toHiRes)
-        .filter(
-          (url) =>
-            url &&
-            url !== mainImageUrl &&
-            !url.includes("icon") &&
-            !url.includes("overlay")
-        );
-
-      return {
-        title: (title || "").trim(),
-        brand: brand.trim(),
-        itemForm: itemForm.trim(),
-        price: (price || "").trim(),
-        mainImageUrl,
-        additionalImageUrls,
-      };
-    },
-    title,
-    toHiRes.toString()
-  );
+    return {
+      title: (title || "").trim(),
+      brand: brand.trim(),
+      itemForm: itemForm.trim(),
+      price: (price || "").trim(),
+      mainImageUrl,
+      additionalImageUrls,
+    };
+  }, { title, toHiResStr: toHiRes.toString() });
 }
 
 /**
