@@ -97,18 +97,32 @@ async function scrapeProductData(page) {
       return "";
     })();
 
-    const additionalImageUrls = Array.from(
+    // Normalize thumbnail -> full-size by removing size tokens like ._SS40_, ._AC_US40_, etc.
+    const normalizeImageUrl = (url) => {
+      if (!url) return "";
+      return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
+    };
+
+    const normalizedMain = normalizeImageUrl(mainImageUrl.trim());
+
+    let additionalImageUrls = Array.from(
       document.querySelectorAll("#altImages img, .imageThumb img")
     )
       .map((img) => img.getAttribute("src") || "")
-      .filter((src) => src && !src.includes("sprite"));
+      .filter((src) => src && !src.includes("sprite"))
+      .map((src) => normalizeImageUrl(src));
+
+    // Deduplicate: remove mainImageUrl and duplicates
+    additionalImageUrls = [...new Set(additionalImageUrls)].filter(
+      (url) => url !== normalizedMain
+    );
 
     return {
       title: (title || "").trim(),
       brand: brand.trim(),
       itemForm: itemForm.trim(),
       price: (price || "").trim(),
-      mainImageUrl: mainImageUrl.trim(),
+      mainImageUrl: normalizedMain,
       additionalImageUrls,
     };
   }, title);
