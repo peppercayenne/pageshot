@@ -64,11 +64,6 @@ async function scrapeProductData(page) {
     (await page.textContent("#title").catch(() => null));
 
   return await page.evaluate((title) => {
-    const text = (sel) => {
-      const el = document.querySelector(sel);
-      return el ? (el.textContent || "").trim() : "";
-    };
-
     const brand = (() => {
       const byline = document.querySelector("#bylineInfo");
       if (byline) return byline.textContent.trim();
@@ -102,12 +97,19 @@ async function scrapeProductData(page) {
       return "";
     })();
 
+    const additionalImageUrls = Array.from(
+      document.querySelectorAll("#altImages img, .imageThumb img")
+    )
+      .map((img) => img.getAttribute("src") || "")
+      .filter((src) => src && !src.includes("sprite"));
+
     return {
       title: (title || "").trim(),
       brand: brand.trim(),
       itemForm: itemForm.trim(),
       price: (price || "").trim(),
       mainImageUrl: mainImageUrl.trim(),
+      additionalImageUrls,
     };
   }, title);
 }
@@ -149,7 +151,8 @@ app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
 
-  const width = 1280, height = 800;
+  const width = 1280,
+    height = 800;
   let browser;
   try {
     const { browser: br, page } = await minimalContext(width, height);
