@@ -56,75 +56,87 @@ async function minimalContext(width, height) {
 }
 
 /**
- * Scrape product data from DOM (using hiRes images)
+ * Scrape product data from DOM
  */
 async function scrapeProductData(page) {
   const title =
     (await page.textContent("#productTitle").catch(() => null)) ||
     (await page.textContent("#title").catch(() => null));
 
-  // Extract raw data from page
-  const { mainImageUrl, hiResImages } = await page.evaluate(() => {
-    // Main image
-    const mainImageEl = document.querySelector("#imgTagWrapperId img");
-    const mainImageUrl = mainImageEl ? mainImageEl.getAttribute("src") : "";
+  return await page.evaluate((title) => {
+    const brand = (() => {
+      const byline = document.querySelector("#bylineInfo");
+      if (byline) return byline.textContent.trim();
+      return "";
+    })();
 
-    // hiRes images (from data-a-dynamic-image JSON)
-    let hiResImages = [];
-    const imgTag = document.querySelector("#imgTagWrapperId img");
-    if (imgTag && imgTag.dataset.aDynamicImage) {
-      try {
-        const data = JSON.parse(imgTag.dataset.aDynamicImage);
-        hiResImages = Object.keys(data);
-      } catch {}
+    const itemForm = (() => {
+      const li = Array.from(document.querySelectorAll("li")).find((el) =>
+        (el.textContent || "").toLowerCase().includes("item form")
+      );
+      if (li) {
+        const parts = (li.textContent || "").split(":");
+        if (parts.length > 1) return parts.slice(1).join(":").trim();
+      }
+      return "";
+    })();
+
+    let price = "";
+    const candidates = Array.from(
+      document.querySelectorAll(".a-price .a-offscreen")
+    )
+      .map((el) => (el.textContent || "").trim())
+      .filter((t) => /^\$?\d/.test(t));
+    if (candidates.length) {
+      price = candidates[0];
     }
 
-    return { mainImageUrl, hiResImages };
-  });
+    const mainImageUrl = (() => {
+      const imgTag = document.querySelector("#imgTagWrapperId img");
+      if (imgTag) return imgTag.getAttribute("src") || "";
+      return "";
+    })();
 
-  // Now evaluate rest of product info
-  return await page.evaluate(
-    ({ title, mainImageUrl, hiResImages }) => {
-      const brand = (() => {
-        const byline = document.querySelector("#bylineInfo");
-        if (byline) return byline.textContent.trim();
-        return "";
-      })();
+    // Normalize thumbnail -> full-size
+    const normalizeImageUrl = (url) => {
+      if (!url) return "";
+      return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
+    };
 
-      const itemForm = (() => {
-        const li = Array.from(document.querySelectorAll("li")).find((el) =>
-          (el.textContent || "").toLowerCase().includes("item form")
+    const normalizedMain = normalizeImageUrl(mainImageUrl.trim());
+
+    let additionalImageUrls = Array.from(
+      document.querySelectorAll("#altImages img, .imageThumb img")
+    )
+      .map((img) => img.getAttribute("src") || "")
+      .map((src) => normalizeImageUrl(src))
+      .filter((src) => {
+        if (!src) return false;
+        const lower = src.toLowerCase();
+        return !(
+          lower.includes("sprite") ||
+          lower.includes("360_icon") ||
+          lower.includes("play-icon") ||
+          lower.includes("overlay") ||
+          lower.includes("fmjpg") ||
+          lower.includes("fmpng")
         );
-        if (li) {
-          const parts = (li.textContent || "").split(":");
-          if (parts.length > 1) return parts.slice(1).join(":").trim();
-        }
-        return "";
-      })();
+      });
 
-      let price = "";
-      const candidates = Array.from(
-        document.querySelectorAll(".a-price .a-offscreen")
-      )
-        .map((el) => (el.textContent || "").trim())
-        .filter((t) => /^\$?\d/.test(t));
-      if (candidates.length) {
-        price = candidates[0];
-      }
+    // Deduplicate: remove mainImageUrl and duplicates
+    additionalImageUrls = [...new Set(additionalImageUrls)].filter(
+      (url) => url !== normalizedMain
+    );
 
-      return {
-        title: (title || "").trim(),
-        brand: brand.trim(),
-        itemForm: itemForm.trim(),
-        price: (price || "").trim(),
-        mainImageUrl,
-        additionalImageUrls: (hiResImages || []).filter(
-          (u) => u && u !== mainImageUrl
-        ),
-      };
-    },
-    { title, mainImageUrl, hiResImages }
-  );
+    return {
+      title: (title || "").trim(),
+      brand: brand.trim(),
+      itemForm: itemForm.trim(),
+      price: (price || "").trim(),
+      mainImageUrl: normalizedMain,
+      additionalImageUrls,
+    };
+  }, title);
 }
 
 /**
