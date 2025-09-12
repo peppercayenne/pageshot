@@ -1,6 +1,7 @@
 // index.js
 // Express + Playwright + Gemini OCR
 // Scrapes Amazon product info via DOM + Gemini OCR on screenshot
+// Uses hiRes image extraction from embedded JSON
 //
 // GET /scrape?url=...
 
@@ -56,106 +57,81 @@ async function minimalContext(width, height) {
 }
 
 /**
- * Scrape product data from DOM + modal hi-res images
+ * Scrape product data from DOM + hiRes image extraction
  */
 async function scrapeProductData(page) {
   const title =
     (await page.textContent("#productTitle").catch(() => null)) ||
     (await page.textContent("#title").catch(() => null));
 
-  const baseData = await page.evaluate((title) => {
-    const brand = (() => {
-      const byline = document.querySelector("#bylineInfo");
-      return byline ? byline.textContent.trim() : "";
-    })();
+  // Get the raw HTML
+  const html = await page.content();
 
-    const itemForm = (() => {
-      const li = Array.from(document.querySelectorAll("li")).find((el) =>
-        (el.textContent || "").toLowerCase().includes("item form")
-      );
-      if (li) {
-        const parts = (li.textContent || "").split(":");
-        if (parts.length > 1) return parts.slice(1).join(":").trim();
-      }
-      return "";
-    })();
-
-    let price = "";
-    const candidates = Array.from(
-      document.querySelectorAll(".a-price .a-offscreen")
-    )
-      .map((el) => (el.textContent || "").trim())
-      .filter((t) => /^\$?\d/.test(t));
-    if (candidates.length) {
-      price = candidates[0];
-    }
-
-    const mainImageUrl = (() => {
-      const imgTag = document.querySelector("#imgTagWrapperId img");
-      return imgTag ? imgTag.getAttribute("src") || "" : "";
-    })();
-
-    return {
-      title: (title || "").trim(),
-      brand: brand.trim(),
-      itemForm: itemForm.trim(),
-      price: (price || "").trim(),
-      mainImageUrl: mainImageUrl.trim(),
-    };
-  }, title);
-
-  // normalize Amazon image URL (remove size suffixes)
-  const normalizeImageUrl = (url) => {
-    if (!url) return "";
-    return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
-  };
-  baseData.mainImageUrl = normalizeImageUrl(baseData.mainImageUrl);
-
-  // now extract hi-res images from modal
-  const thumbnails = await page.$$("#altImages img, .imageThumb img");
-  const additionalImageUrls = [];
-
-  for (const thumb of thumbnails) {
-    try {
-      await thumb.scrollIntoViewIfNeeded();
-      await thumb.click({ delay: 100 });
-
-      // wait for modal image
-      const largeImg = await page.waitForSelector(
-        "#ivLargeImage img.fullscreen",
-        { timeout: 5000 }
-      );
-      const src = await largeImg.getAttribute("src");
-      if (src) {
-        const normalized = normalizeImageUrl(src);
-        const lower = normalized.toLowerCase();
-        if (
-          normalized &&
-          !lower.includes("sprite") &&
-          !lower.includes("360_icon") &&
-          !lower.includes("play-icon") &&
-          !lower.includes("overlay") &&
-          !lower.includes("fmjpg") &&
-          !lower.includes("fmpng")
-        ) {
-          if (normalized !== baseData.mainImageUrl) {
-            additionalImageUrls.push(normalized);
-          }
-        }
-      }
-
-      // close modal
-      await page.keyboard.press("Escape");
-      await page.waitForTimeout(300);
-    } catch {
-      // ignore errors (some thumbs may not open modal)
-    }
+  // Regex extract hiRes image URLs
+  let hiResImages = [];
+  const regex = /"hiRes"\s*:\s*"([^"]+)"/g;
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    if (match[1]) hiResImages.push(match[1]);
   }
 
-  // dedupe
-  baseData.additionalImageUrls = [...new Set(additionalImageUrls)];
+  // Deduplicate & filter icons/overlays
+  hiResImages = [...new Set(hiResImages)].filter((url) => {
+    const lower = url.toLowerCase();
+    return !(
+      lower.includes("sprite") ||
+      lower.includes("360_icon") ||
+      lower.includes("play-icon") ||
+      lower.includes("overlay") ||
+      lower.includes("fmjpg") ||
+      lower.includes("fmpng")
+    );
+  });
 
-  return baseData;
+  const mainImageUrl = hiResImages.length > 0 ? hiResImages[0] : "";
+
+  return await page.evaluate(
+    (title, mainImageUrl, hiResImages) => {
+      const brand = (() => {
+        const byline = document.querySelector("#bylineInfo");
+        if (byline) return byline.textContent.trim();
+        return "";
+      })();
+
+      const itemForm = (() => {
+        const li = Array.from(document.querySelectorAll("li")).find((el) =>
+          (el.textContent || "").toLowerCase().includes("item form")
+        );
+        if (li) {
+          const parts = (li.textContent || "").split(":");
+          if (parts.length > 1) return parts.slice(1).join(":").trim();
+        }
+        return "";
+      })();
+
+      let price = "";
+      const candidates = Array.from(
+        document.querySelectorAll(".a-price .a-offscreen")
+      )
+        .map((el) => (el.textContent || "").trim())
+        .filter((t) => /^\$?\d/.test(t));
+      if (candidates.length) {
+        price = candidates[0];
+      }
+
+      return {
+        title: (title || "").trim(),
+        brand: brand.trim(),
+        itemForm: itemForm.trim(),
+        price: (price || "").trim(),
+        mainImageUrl,
+        additionalImageUrls: hiResImages.filter((u) => u !== mainImageUrl),
+      };
+    },
+    title,
+    mainImageUrl,
+    hiResImages
+  );
 }
 
 /**
@@ -193,7 +169,8 @@ app.get("/", (req, res) => {
 
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
-  if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
+  if (!url)
+    return res.status(400).json({ ok: false, error: "Missing url param" });
 
   const width = 1280,
     height = 800;
@@ -203,7 +180,7 @@ app.get("/scrape", async (req, res) => {
     browser = br;
 
     await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1000);
 
     // Scraping
     const scraped = await scrapeProductData(page);
