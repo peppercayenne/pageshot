@@ -91,32 +91,25 @@ async function scrapeProductData(page) {
       price = candidates[0];
     }
 
-    // Main image: prefer data-old-hires
-    const mainImageEl = document.querySelector("#imgTagWrapperId img");
-    const mainImageUrl =
-      (mainImageEl && mainImageEl.getAttribute("data-old-hires")) ||
-      (mainImageEl && mainImageEl.getAttribute("src")) ||
-      "";
-
-    // Additional images: look at all .imgTagWrapper img[data-old-hires]
-    let additionalImageUrls = Array.from(
-      document.querySelectorAll(".imgTagWrapper img")
-    )
-      .map((img) => img.getAttribute("data-old-hires") || img.getAttribute("src") || "")
-      .filter(Boolean)
-      .filter((src) => {
-        const lower = src.toLowerCase();
-        return !(
-          lower.includes("sprite") ||
-          lower.includes("360_icon") ||
-          lower.includes("play-icon") ||
-          lower.includes("overlay") ||
-          lower.includes("fmjpg") ||
-          lower.includes("fmpng")
+    // ✅ Extract main full-size image
+    const mainImageUrl = (() => {
+      const imgTag = document.querySelector("#imgTagWrapperId img, .imgTagWrapper img");
+      if (imgTag) {
+        return (
+          imgTag.getAttribute("data-old-hires") ||
+          imgTag.getAttribute("src") ||
+          ""
         );
-      });
+      }
+      return "";
+    })();
 
-    // Deduplicate and remove main
+    // ✅ Extract all additional full-size images
+    let additionalImageUrls = Array.from(document.querySelectorAll(".imgTagWrapper img"))
+      .map((img) => img.getAttribute("data-old-hires") || img.getAttribute("src") || "")
+      .filter((src) => !!src);
+
+    // Deduplicate: remove mainImageUrl and duplicates
     additionalImageUrls = [...new Set(additionalImageUrls)].filter(
       (url) => url !== mainImageUrl
     );
