@@ -91,26 +91,57 @@ async function scrapeProductData(page) {
       price = candidates[0];
     }
 
-    // ✅ Extract main full-size image
-    const mainImageUrl = (() => {
-      const imgTag = document.querySelector("#imgTagWrapperId img, .imgTagWrapper img");
-      if (imgTag) {
-        return (
-          imgTag.getAttribute("data-old-hires") ||
-          imgTag.getAttribute("src") ||
-          ""
-        );
+    // ✅ Extract images
+    let mainImageUrl = "";
+    const additionalImageUrls = new Set();
+
+    const mainImg = document.querySelector("#imgTagWrapperId img, .imgTagWrapper img");
+    if (mainImg) {
+      // 1. Prefer data-old-hires (highest res)
+      const oldHires = mainImg.getAttribute("data-old-hires");
+      if (oldHires) mainImageUrl = oldHires;
+
+      // 2. Parse data-a-dynamic-image for largest variant
+      if (!mainImageUrl) {
+        const dyn = mainImg.getAttribute("data-a-dynamic-image");
+        if (dyn) {
+          try {
+            const parsed = JSON.parse(dyn);
+            let bestUrl = "";
+            let bestSize = 0;
+            Object.entries(parsed).forEach(([url, size]) => {
+              const pixels = size[0] * size[1];
+              if (pixels > bestSize) {
+                bestSize = pixels;
+                bestUrl = url;
+              }
+            });
+            if (bestUrl) mainImageUrl = bestUrl;
+          } catch {}
+        }
       }
-      return "";
-    })();
 
-    // ✅ Extract all additional full-size images
-    let additionalImageUrls = Array.from(document.querySelectorAll(".imgTagWrapper img"))
-      .map((img) => img.getAttribute("data-old-hires") || img.getAttribute("src") || "")
-      .filter((src) => !!src);
+      // 3. Fallback: src
+      if (!mainImageUrl) {
+        const src = mainImg.getAttribute("src");
+        if (src) mainImageUrl = src;
+      }
+    }
 
-    // Deduplicate: remove mainImageUrl and duplicates
-    additionalImageUrls = [...new Set(additionalImageUrls)].filter(
+    // --- Thumbnails as additional images
+    document.querySelectorAll("#altImages img").forEach((thumb) => {
+      let src = thumb.getAttribute("src");
+      if (src) {
+        // Clean Amazon’s size suffix (._AC_SX..._)
+        src = src.replace(/\._[A-Z0-9,]+_\./, ".");
+        // skip if it looks like an icon (like play button overlays)
+        if (/sprite|icon|play/.test(src.toLowerCase())) return;
+        additionalImageUrls.add(src);
+      }
+    });
+
+    // Remove duplicates and main image
+    const finalAdditional = [...additionalImageUrls].filter(
       (url) => url !== mainImageUrl
     );
 
@@ -120,7 +151,7 @@ async function scrapeProductData(page) {
       itemForm: itemForm.trim(),
       price: (price || "").trim(),
       mainImageUrl: mainImageUrl.trim(),
-      additionalImageUrls,
+      additionalImageUrls: finalAdditional,
     };
   }, title);
 }
