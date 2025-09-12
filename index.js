@@ -91,67 +91,55 @@ async function scrapeProductData(page) {
       price = candidates[0];
     }
 
-    // ✅ Extract images
-    let mainImageUrl = "";
-    const additionalImageUrls = new Set();
+    // ✅ Extract main image full resolution
+    const mainImageUrl = (() => {
+      const imgTag = document.querySelector("#landingImage");
+      if (!imgTag) return "";
 
-    const mainImg = document.querySelector("#imgTagWrapperId img, .imgTagWrapper img");
-    if (mainImg) {
-      // 1. Prefer data-old-hires (highest res)
-      const oldHires = mainImg.getAttribute("data-old-hires");
-      if (oldHires) mainImageUrl = oldHires;
+      // Prefer `data-old-hires`
+      let hires = imgTag.getAttribute("data-old-hires");
+      if (hires) return hires;
 
-      // 2. Parse data-a-dynamic-image for largest variant
-      if (!mainImageUrl) {
-        const dyn = mainImg.getAttribute("data-a-dynamic-image");
+      // Fallback: parse `data-a-dynamic-image` and get the largest
+      let dyn = imgTag.getAttribute("data-a-dynamic-image");
+      if (dyn) {
+        try {
+          const parsed = JSON.parse(dyn.replace(/&quot;/g, '"'));
+          const entries = Object.entries(parsed);
+          entries.sort((a, b) => b[1][0] - a[1][0]); // sort by width desc
+          return entries[0][0]; // biggest URL
+        } catch {}
+      }
+
+      return imgTag.src || "";
+    })();
+
+    // ✅ Extract additional hi-res images from #altImages
+    const additionalImageUrls = (() => {
+      const urls = new Set();
+
+      document.querySelectorAll("#altImages li").forEach((li) => {
+        const dyn = li.getAttribute("data-a-dynamic-image");
         if (dyn) {
           try {
-            const parsed = JSON.parse(dyn);
-            let bestUrl = "";
-            let bestSize = 0;
-            Object.entries(parsed).forEach(([url, size]) => {
-              const pixels = size[0] * size[1];
-              if (pixels > bestSize) {
-                bestSize = pixels;
-                bestUrl = url;
-              }
-            });
-            if (bestUrl) mainImageUrl = bestUrl;
+            const parsed = JSON.parse(dyn.replace(/&quot;/g, '"'));
+            const entries = Object.entries(parsed);
+            entries.sort((a, b) => b[1][0] - a[1][0]); // biggest first
+            urls.add(entries[0][0]);
           } catch {}
         }
-      }
+      });
 
-      // 3. Fallback: src
-      if (!mainImageUrl) {
-        const src = mainImg.getAttribute("src");
-        if (src) mainImageUrl = src;
-      }
-    }
-
-    // --- Thumbnails as additional images
-    document.querySelectorAll("#altImages img").forEach((thumb) => {
-      let src = thumb.getAttribute("src");
-      if (src) {
-        // Clean Amazon’s size suffix (._AC_SX..._)
-        src = src.replace(/\._[A-Z0-9,]+_\./, ".");
-        // skip if it looks like an icon (like play button overlays)
-        if (/sprite|icon|play/.test(src.toLowerCase())) return;
-        additionalImageUrls.add(src);
-      }
-    });
-
-    // Remove duplicates and main image
-    const finalAdditional = [...additionalImageUrls].filter(
-      (url) => url !== mainImageUrl
-    );
+      return [...urls].filter((u) => u && u !== mainImageUrl);
+    })();
 
     return {
       title: (title || "").trim(),
       brand: brand.trim(),
       itemForm: itemForm.trim(),
       price: (price || "").trim(),
-      mainImageUrl: mainImageUrl.trim(),
-      additionalImageUrls: finalAdditional,
+      mainImageUrl: (mainImageUrl || "").trim(),
+      additionalImageUrls,
     };
   }, title);
 }
