@@ -91,27 +91,20 @@ async function scrapeProductData(page) {
       price = candidates[0];
     }
 
-    const mainImageUrl = (() => {
-      const imgTag = document.querySelector("#imgTagWrapperId img");
-      if (imgTag) return imgTag.getAttribute("src") || "";
-      return "";
-    })();
+    // Main image: prefer data-old-hires
+    const mainImageEl = document.querySelector("#imgTagWrapperId img");
+    const mainImageUrl =
+      (mainImageEl && mainImageEl.getAttribute("data-old-hires")) ||
+      (mainImageEl && mainImageEl.getAttribute("src")) ||
+      "";
 
-    // Normalize thumbnail -> full-size
-    const normalizeImageUrl = (url) => {
-      if (!url) return "";
-      return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
-    };
-
-    const normalizedMain = normalizeImageUrl(mainImageUrl.trim());
-
+    // Additional images: look at all .imgTagWrapper img[data-old-hires]
     let additionalImageUrls = Array.from(
-      document.querySelectorAll("#altImages img, .imageThumb img")
+      document.querySelectorAll(".imgTagWrapper img")
     )
-      .map((img) => img.getAttribute("src") || "")
-      .map((src) => normalizeImageUrl(src))
+      .map((img) => img.getAttribute("data-old-hires") || img.getAttribute("src") || "")
+      .filter(Boolean)
       .filter((src) => {
-        if (!src) return false;
         const lower = src.toLowerCase();
         return !(
           lower.includes("sprite") ||
@@ -123,9 +116,9 @@ async function scrapeProductData(page) {
         );
       });
 
-    // Deduplicate: remove mainImageUrl and duplicates
+    // Deduplicate and remove main
     additionalImageUrls = [...new Set(additionalImageUrls)].filter(
-      (url) => url !== normalizedMain
+      (url) => url !== mainImageUrl
     );
 
     return {
@@ -133,7 +126,7 @@ async function scrapeProductData(page) {
       brand: brand.trim(),
       itemForm: itemForm.trim(),
       price: (price || "").trim(),
-      mainImageUrl: normalizedMain,
+      mainImageUrl: mainImageUrl.trim(),
       additionalImageUrls,
     };
   }, title);
