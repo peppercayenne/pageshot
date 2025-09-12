@@ -91,54 +91,49 @@ async function scrapeProductData(page) {
       price = candidates[0];
     }
 
-    // ✅ Extract main image full resolution
     const mainImageUrl = (() => {
-      const imgTag = document.querySelector("#landingImage");
-      if (!imgTag) return "";
-
-      // Prefer `data-old-hires`
-      let hires = imgTag.getAttribute("data-old-hires");
-      if (hires) return hires;
-
-      // Fallback: parse `data-a-dynamic-image` and get the largest
-      let dyn = imgTag.getAttribute("data-a-dynamic-image");
-      if (dyn) {
-        try {
-          const parsed = JSON.parse(dyn.replace(/&quot;/g, '"'));
-          const entries = Object.entries(parsed);
-          entries.sort((a, b) => b[1][0] - a[1][0]); // sort by width desc
-          return entries[0][0]; // biggest URL
-        } catch {}
-      }
-
-      return imgTag.src || "";
+      const imgTag = document.querySelector("#imgTagWrapperId img");
+      if (imgTag) return imgTag.getAttribute("src") || "";
+      return "";
     })();
 
-    // ✅ Extract additional hi-res images from #altImages
-    const additionalImageUrls = (() => {
-      const urls = new Set();
+    // Normalize thumbnail -> full-size
+    const normalizeImageUrl = (url) => {
+      if (!url) return "";
+      return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
+    };
 
-      document.querySelectorAll("#altImages li").forEach((li) => {
-        const dyn = li.getAttribute("data-a-dynamic-image");
-        if (dyn) {
-          try {
-            const parsed = JSON.parse(dyn.replace(/&quot;/g, '"'));
-            const entries = Object.entries(parsed);
-            entries.sort((a, b) => b[1][0] - a[1][0]); // biggest first
-            urls.add(entries[0][0]);
-          } catch {}
-        }
+    const normalizedMain = normalizeImageUrl(mainImageUrl.trim());
+
+    let additionalImageUrls = Array.from(
+      document.querySelectorAll("#altImages img, .imageThumb img")
+    )
+      .map((img) => img.getAttribute("src") || "")
+      .map((src) => normalizeImageUrl(src))
+      .filter((src) => {
+        if (!src) return false;
+        const lower = src.toLowerCase();
+        return !(
+          lower.includes("sprite") ||
+          lower.includes("360_icon") ||
+          lower.includes("play-icon") ||
+          lower.includes("overlay") ||
+          lower.includes("fmjpg") ||
+          lower.includes("fmpng")
+        );
       });
 
-      return [...urls].filter((u) => u && u !== mainImageUrl);
-    })();
+    // Deduplicate: remove mainImageUrl and duplicates
+    additionalImageUrls = [...new Set(additionalImageUrls)].filter(
+      (url) => url !== normalizedMain
+    );
 
     return {
       title: (title || "").trim(),
       brand: brand.trim(),
       itemForm: itemForm.trim(),
       price: (price || "").trim(),
-      mainImageUrl: (mainImageUrl || "").trim(),
+      mainImageUrl: normalizedMain,
       additionalImageUrls,
     };
   }, title);
