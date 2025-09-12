@@ -1,7 +1,6 @@
 // index.js
 // Express + Playwright + Gemini OCR
 // Scrapes Amazon product info via DOM + Gemini OCR on screenshot
-// Uses hiRes image extraction from embedded JSON
 //
 // GET /scrape?url=...
 
@@ -57,41 +56,35 @@ async function minimalContext(width, height) {
 }
 
 /**
- * Scrape product data from DOM + hiRes image extraction
+ * Scrape product data from DOM (using hiRes images)
  */
 async function scrapeProductData(page) {
   const title =
     (await page.textContent("#productTitle").catch(() => null)) ||
     (await page.textContent("#title").catch(() => null));
 
-  // Get the raw HTML
-  const html = await page.content();
+  // Extract raw data from page
+  const { mainImageUrl, hiResImages } = await page.evaluate(() => {
+    // Main image
+    const mainImageEl = document.querySelector("#imgTagWrapperId img");
+    const mainImageUrl = mainImageEl ? mainImageEl.getAttribute("src") : "";
 
-  // Regex extract hiRes image URLs
-  let hiResImages = [];
-  const regex = /"hiRes"\s*:\s*"([^"]+)"/g;
-  let match;
-  while ((match = regex.exec(html)) !== null) {
-    if (match[1]) hiResImages.push(match[1]);
-  }
+    // hiRes images (from data-a-dynamic-image JSON)
+    let hiResImages = [];
+    const imgTag = document.querySelector("#imgTagWrapperId img");
+    if (imgTag && imgTag.dataset.aDynamicImage) {
+      try {
+        const data = JSON.parse(imgTag.dataset.aDynamicImage);
+        hiResImages = Object.keys(data);
+      } catch {}
+    }
 
-  // Deduplicate & filter icons/overlays
-  hiResImages = [...new Set(hiResImages)].filter((url) => {
-    const lower = url.toLowerCase();
-    return !(
-      lower.includes("sprite") ||
-      lower.includes("360_icon") ||
-      lower.includes("play-icon") ||
-      lower.includes("overlay") ||
-      lower.includes("fmjpg") ||
-      lower.includes("fmpng")
-    );
+    return { mainImageUrl, hiResImages };
   });
 
-  const mainImageUrl = hiResImages.length > 0 ? hiResImages[0] : "";
-
+  // Now evaluate rest of product info
   return await page.evaluate(
-    (title, mainImageUrl, hiResImages) => {
+    ({ title, mainImageUrl, hiResImages }) => {
       const brand = (() => {
         const byline = document.querySelector("#bylineInfo");
         if (byline) return byline.textContent.trim();
@@ -125,12 +118,12 @@ async function scrapeProductData(page) {
         itemForm: itemForm.trim(),
         price: (price || "").trim(),
         mainImageUrl,
-        additionalImageUrls: hiResImages.filter((u) => u !== mainImageUrl),
+        additionalImageUrls: (hiResImages || []).filter(
+          (u) => u && u !== mainImageUrl
+        ),
       };
     },
-    title,
-    mainImageUrl,
-    hiResImages
+    { title, mainImageUrl, hiResImages }
   );
 }
 
@@ -169,8 +162,7 @@ app.get("/", (req, res) => {
 
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
-  if (!url)
-    return res.status(400).json({ ok: false, error: "Missing url param" });
+  if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
 
   const width = 1280,
     height = 800;
