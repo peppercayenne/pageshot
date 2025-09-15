@@ -123,10 +123,14 @@ async function scrapeProductData(page) {
         );
       });
 
-    // Deduplicate: remove mainImageUrl and duplicates
-    additionalImageUrls = [...new Set(additionalImageUrls)].filter(
-      (url) => url !== normalizedMain
-    );
+    // 🔍 Scan entire document for hi-res URLs ending with ._AC_SL1500_.jpg
+    const hiResMatches = Array.from(
+      document.documentElement.innerHTML.matchAll(/https:\/\/[^"]+?\._AC_SL1500_\.jpg/gi)
+    ).map((m) => m[0]);
+
+    additionalImageUrls = [
+      ...new Set([...additionalImageUrls, ...hiResMatches]),
+    ].filter((url) => url !== normalizedMain);
 
     return {
       title: (title || "").trim(),
