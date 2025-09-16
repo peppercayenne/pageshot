@@ -97,13 +97,13 @@ async function scrapeProductData(page) {
       return "";
     })();
 
-    // Normalize thumbnail -> full-size
+    // Normalize thumbnail -> base jpg (do not force AC_SL here)
     const normalizeImageUrl = (url) => {
       if (!url) return "";
       return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
     };
 
-    const normalizedMain = normalizeImageUrl(mainImageUrl.trim());
+    const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
     let additionalImageUrls = Array.from(
       document.querySelectorAll("#altImages img, .imageThumb img")
@@ -123,14 +123,23 @@ async function scrapeProductData(page) {
         );
       });
 
-    // 🔍 Scan entire document for hi-res URLs ending with ._AC_SL1500_.jpg
+    // 🔍 Scan entire document for hi-res URLs ending with ._AC_SL1500_.jpg (allow optional query)
     const hiResMatches = Array.from(
-      document.documentElement.innerHTML.matchAll(/https:\/\/[^"]+?\._AC_SL1500_\.jpg/gi)
+      document.documentElement.innerHTML.matchAll(
+        /https:\/\/[^"]+?\._AC_SL1500_\.jpg(?:\?[^"]*)?/gi
+      )
     ).map((m) => m[0]);
 
-    additionalImageUrls = [
-      ...new Set([...additionalImageUrls, ...hiResMatches]),
-    ].filter((url) => url !== normalizedMain);
+    // Merge, dedupe
+    additionalImageUrls = [...new Set([...additionalImageUrls, ...hiResMatches])];
+
+    // Final pass:
+    // 1) Remove main image if present
+    // 2) STRICTLY keep only AC_SL1500 images (handles optional query strings)
+    const AC1500 = /._AC_SL1500_\.jpg(?:\?.*)?$/i;
+    additionalImageUrls = additionalImageUrls
+      .filter((url) => url && url !== normalizedMain)
+      .filter((url) => AC1500.test(url));
 
     return {
       title: (title || "").trim(),
@@ -187,7 +196,8 @@ app.get("/scrape", async (req, res) => {
     const { browser: br, page } = await minimalContext(width, height);
     browser = br;
 
-    await page.goto(url, { timeout: 60000, waitUntil: "domcontentloaded" });
+    // ⏱️ Increase navigation timeout to 90s
+    await page.goto(url, { timeout: 90000, waitUntil: "domcontentloaded" });
     await page.waitForTimeout(1000);
 
     // Scraping
