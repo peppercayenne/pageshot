@@ -56,6 +56,86 @@ async function minimalContext(width, height) {
 }
 
 /**
+ * Simple helpers
+ */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
+
+function isRobotCheckUrl(url) {
+  if (!url) return false;
+  return (
+    url.includes("/errors/validateCaptcha") ||
+    url.includes("/errors/validateCaptcha") ||
+    url.includes("/captcha") ||
+    url.includes("/sorry")
+  );
+}
+
+async function looksBlocked(page) {
+  try {
+    const url = page.url();
+    if (isRobotCheckUrl(url)) return true;
+
+    const title = (await page.title().catch(() => "")) || "";
+    if (/robot check/i.test(title) || /captcha/i.test(title)) return true;
+
+    // Quick body sniff (don’t rely on loaded selectors)
+    const bodyText = await page.evaluate(() => document.body?.innerText || "");
+    if (
+      /enter the characters/i.test(bodyText) ||
+      /type the characters/i.test(bodyText) ||
+      /sorry/i.test(bodyText)
+    ) {
+      return true;
+    }
+  } catch {
+    // if any of those throw, treat as not blocked (we'll fail elsewhere)
+  }
+  return false;
+}
+
+/**
+ * Navigation with retry + CAPTCHA detection
+ * - waitUntil: 'commit' to avoid long loads
+ * - timeout: 60s
+ * - retries: 2 (total 3 attempts)
+ */
+async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
+  let attempt = 0;
+  let lastErr;
+
+  while (attempt <= retries) {
+    try {
+      // Slight random delay before navigating to reduce burst patterns
+      await sleep(jitter(250, 500));
+
+      await page.goto(url, { timeout, waitUntil: "commit" });
+
+      // Give the DOM a moment to render initial HTML
+      await sleep(jitter(700, 600));
+
+      // Block/robot check detection
+      if (await looksBlocked(page)) {
+        throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
+      }
+
+      return; // success
+    } catch (err) {
+      lastErr = err;
+      // If page got closed for any reason, don't reuse it
+      if (page.isClosed()) throw lastErr;
+
+      // Backoff before retrying (1s..2.5s jitter)
+      if (attempt < retries) {
+        await sleep(jitter(1000, 1500));
+      }
+      attempt++;
+    }
+  }
+  throw lastErr || new Error("Navigation failed");
+}
+
+/**
  * Scrape product data from DOM
  */
 async function scrapeProductData(page) {
@@ -136,7 +216,7 @@ async function scrapeProductData(page) {
     // Final pass:
     // 1) Remove main image if present
     // 2) STRICTLY keep only AC_SL1500 images (handles optional query strings)
-    const AC1500 = /._AC_SL1500_\.jpg(?:\?.*)?$/i;
+    const AC1500 = /\._AC_SL1500_\.jpg(?:\?.*)?$/i;
     additionalImageUrls = additionalImageUrls
       .filter((url) => url && url !== normalizedMain)
       .filter((url) => AC1500.test(url));
@@ -191,14 +271,19 @@ app.get("/scrape", async (req, res) => {
 
   const width = 1280,
     height = 800;
-  let browser;
-  try {
-    const { browser: br, page } = await minimalContext(width, height);
-    browser = br;
 
-    // ⏱️ Increase navigation timeout to 90s
-    await page.goto(url, { timeout: 90000, waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(1000);
+  let browser;
+  let page;
+  try {
+    const ctx = await minimalContext(width, height);
+    browser = ctx.browser;
+    page = ctx.page;
+
+    // Hardened navigation with retry + CAPTCHA detection
+    await safeGoto(page, url, { retries: 2, timeout: 60000 });
+
+    // One small, bounded wait to let above-the-fold content stabilize
+    await sleep(jitter(500, 500));
 
     // Scraping
     const scraped = await scrapeProductData(page);
@@ -210,7 +295,6 @@ app.get("/scrape", async (req, res) => {
     // Gemini OCR
     const geminiData = await geminiExtract(base64);
 
-    await browser.close();
     res.json({
       ok: true,
       url,
@@ -219,13 +303,18 @@ app.get("/scrape", async (req, res) => {
       screenshot: base64,
     });
   } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
+  } finally {
+    // Always try to close, ignoring errors
+    try {
+      if (page && !page.isClosed()) await page.close({ runBeforeUnload: false });
+    } catch {}
     try {
       await browser?.close();
     } catch {}
-    res.status(500).json({
-      ok: false,
-      error: err.message || String(err),
-    });
   }
 });
 
