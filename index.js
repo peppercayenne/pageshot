@@ -65,7 +65,6 @@ function isRobotCheckUrl(url) {
   if (!url) return false;
   return (
     url.includes("/errors/validateCaptcha") ||
-    url.includes("/errors/validateCaptcha") ||
     url.includes("/captcha") ||
     url.includes("/sorry")
   );
@@ -89,7 +88,7 @@ async function looksBlocked(page) {
       return true;
     }
   } catch {
-    // if any of those throw, treat as not blocked (we'll fail elsewhere)
+    // ignore and treat as not blocked
   }
   return false;
 }
@@ -106,12 +105,12 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
 
   while (attempt <= retries) {
     try {
-      // Slight random delay before navigating to reduce burst patterns
+      // slight random delay before navigating to reduce burst patterns
       await sleep(jitter(250, 500));
 
       await page.goto(url, { timeout, waitUntil: "commit" });
 
-      // Give the DOM a moment to render initial HTML
+      // give the DOM a moment to render initial HTML
       await sleep(jitter(700, 600));
 
       // Block/robot check detection
@@ -122,13 +121,10 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
       return; // success
     } catch (err) {
       lastErr = err;
-      // If page got closed for any reason, don't reuse it
       if (page.isClosed()) throw lastErr;
 
-      // Backoff before retrying (1s..2.5s jitter)
-      if (attempt < retries) {
-        await sleep(jitter(1000, 1500));
-      }
+      // backoff before retrying (1s..2.5s jitter)
+      if (attempt < retries) await sleep(jitter(1000, 1500));
       attempt++;
     }
   }
@@ -282,14 +278,28 @@ app.get("/scrape", async (req, res) => {
     // Hardened navigation with retry + CAPTCHA detection
     await safeGoto(page, url, { retries: 2, timeout: 60000 });
 
+    if (page.isClosed()) {
+      throw new Error("Page unexpectedly closed after navigation");
+    }
+
     // One small, bounded wait to let above-the-fold content stabilize
     await sleep(jitter(500, 500));
 
     // Scraping
     const scraped = await scrapeProductData(page);
 
+    if (page.isClosed()) {
+      throw new Error("Page closed before screenshot");
+    }
+
     // Screenshot for OCR
-    const buf = await page.screenshot({ type: "png" });
+    let buf;
+    try {
+      buf = await page.screenshot({ type: "png" });
+    } catch (err) {
+      throw new Error("Screenshot failed: " + err.message);
+    }
+
     const base64 = buf.toString("base64");
 
     // Gemini OCR
