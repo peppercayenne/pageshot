@@ -61,6 +61,12 @@ async function minimalContext(width, height) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
 
+function ensureAlive(page, msg = "Page is closed") {
+  if (!page || page.isClosed()) {
+    throw new Error(msg);
+  }
+}
+
 function isRobotCheckUrl(url) {
   if (!url) return false;
   return (
@@ -129,6 +135,32 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
     }
   }
   throw lastErr || new Error("Navigation failed");
+}
+
+/**
+ * Safer screenshot with a small retry
+ */
+async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    ensureAlive(page, "Page closed before screenshot");
+    try {
+      return await page.screenshot(opts);
+    } catch (err) {
+      lastErr = err;
+      const msg = (err && err.message) || String(err);
+      // If the page/context/browser was closed, don't retry further
+      if (/Target page, context or browser has been closed/i.test(msg)) {
+        throw new Error("Screenshot failed: " + msg);
+      }
+      if (i < retries) {
+        await sleep(jitter(250, 500));
+        continue;
+      }
+      throw new Error("Screenshot failed: " + msg);
+    }
+  }
+  throw lastErr || new Error("Screenshot failed");
 }
 
 /**
@@ -327,9 +359,7 @@ app.get("/scrape", async (req, res) => {
     // Hardened navigation with retry + CAPTCHA detection
     await safeGoto(page, url, { retries: 2, timeout: 60000 });
 
-    if (page.isClosed()) {
-      throw new Error("Page unexpectedly closed after navigation");
-    }
+    ensureAlive(page, "Page unexpectedly closed after navigation");
 
     // One small, bounded wait to let above-the-fold content stabilize
     await sleep(jitter(500, 500));
@@ -337,18 +367,10 @@ app.get("/scrape", async (req, res) => {
     // Scraping
     const scraped = await scrapeProductData(page);
 
-    if (page.isClosed()) {
-      throw new Error("Page closed before screenshot");
-    }
+    ensureAlive(page, "Page closed before screenshot");
 
-    // Screenshot for OCR
-    let buf;
-    try {
-      buf = await page.screenshot({ type: "png" });
-    } catch (err) {
-      throw new Error("Screenshot failed: " + err.message);
-    }
-
+    // Screenshot for OCR (with a small retry)
+    const buf = await safeScreenshot(page, { type: "png" }, 1);
     const base64 = buf.toString("base64");
 
     // Gemini OCR
