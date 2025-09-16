@@ -168,7 +168,9 @@ async function scrapeProductData(page) {
     }
 
     const mainImageUrl = (() => {
-      const imgTag = document.querySelector("#imgTagWrapperId img");
+      const imgTag =
+        document.querySelector("#landingImage") ||
+        document.querySelector("#imgTagWrapperId img");
       if (imgTag) return imgTag.getAttribute("src") || "";
       return "";
     })();
@@ -181,41 +183,88 @@ async function scrapeProductData(page) {
 
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
+    // Collect candidate URLs from visible thumbs
     let additionalImageUrls = Array.from(
       document.querySelectorAll("#altImages img, .imageThumb img")
     )
       .map((img) => img.getAttribute("src") || "")
-      .map((src) => normalizeImageUrl(src))
-      .filter((src) => {
-        if (!src) return false;
-        const lower = src.toLowerCase();
-        return !(
-          lower.includes("sprite") ||
-          lower.includes("360_icon") ||
-          lower.includes("play-icon") ||
-          lower.includes("overlay") ||
-          lower.includes("fmjpg") ||
-          lower.includes("fmpng")
-        );
-      });
+      .map((src) => (src || "").trim())
+      .filter(Boolean);
 
-    // 🔍 Scan entire document for hi-res URLs ending with ._AC_SL1500_.jpg (allow optional query)
+    // Also inspect landing image attributes (Amazon often hides best URLs here)
+    const landing =
+      document.querySelector("#landingImage") ||
+      document.querySelector("#imgTagWrapperId img");
+
+    const fromLandingAttrs = [];
+    if (landing) {
+      const oldHires = landing.getAttribute("data-old-hires");
+      if (oldHires) fromLandingAttrs.push(oldHires);
+
+      const dyn = landing.getAttribute("data-a-dynamic-image");
+      if (dyn) {
+        try {
+          // Already JSON in most cases; if HTML-escaped, unescape quotes
+          const clean = dyn.replace(/&quot;/g, '"');
+          const obj = JSON.parse(clean);
+          for (const k of Object.keys(obj || {})) {
+            fromLandingAttrs.push(k);
+          }
+        } catch {
+          // fallback for single-quoted JSON-like strings
+          try {
+            const clean2 = dyn
+              .replace(/&quot;/g, '"')
+              .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":') // keys
+              .replace(/:\s*'([^']+?)'(\s*[},])/g, ':"$1"$2'); // values
+            const obj2 = JSON.parse(clean2);
+            for (const k of Object.keys(obj2 || {})) {
+              fromLandingAttrs.push(k);
+            }
+          } catch {}
+        }
+      }
+    }
+
+    additionalImageUrls = [
+      ...additionalImageUrls,
+      ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
+    ];
+
+    // 🔍 Scan entire document for hi-res URLs ending with ._AC_SL{digits}_.jpg (allow optional query)
     const hiResMatches = Array.from(
       document.documentElement.innerHTML.matchAll(
-        /https:\/\/[^"]+?\._AC_SL1500_\.jpg(?:\?[^"]*)?/gi
+        /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi
       )
     ).map((m) => m[0]);
 
-    // Merge, dedupe
+    // Merge, dedupe early (keep raw variants before filtering)
     additionalImageUrls = [...new Set([...additionalImageUrls, ...hiResMatches])];
 
+    // Remove obvious junk thumbs/sprites/overlays
+    additionalImageUrls = additionalImageUrls.filter((src) => {
+      if (!src) return false;
+      const lower = src.toLowerCase();
+      return !(
+        lower.includes("sprite") ||
+        lower.includes("360_icon") ||
+        lower.includes("play-icon") ||
+        lower.includes("overlay") ||
+        lower.includes("fmjpg") ||
+        lower.includes("fmpng")
+      );
+    });
+
     // Final pass:
-    // 1) Remove main image if present
-    // 2) STRICTLY keep only AC_SL1500 images (handles optional query strings)
-    const AC1500 = /\._AC_SL1500_\.jpg(?:\?.*)?$/i;
+    // 1) Remove main image if present (base jpg)
+    // 2) Keep ANY AC_SL size (e.g., _AC_SL1000_, _AC_SL1500_, _AC_SL2000_, etc.)
+    const AC_ANY = /\._AC_SL\d+_\.jpg(?:\?.*)?$/i;
     additionalImageUrls = additionalImageUrls
       .filter((url) => url && url !== normalizedMain)
-      .filter((url) => AC1500.test(url));
+      .filter((url) => AC_ANY.test(url));
+
+    // Dedupe again in case filters created dupes
+    additionalImageUrls = [...new Set(additionalImageUrls)];
 
     return {
       title: (title || "").trim(),
