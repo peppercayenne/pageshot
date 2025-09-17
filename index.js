@@ -83,7 +83,6 @@ async function looksBlocked(page) {
     const title = (await page.title().catch(() => "")) || "";
     if (/robot check/i.test(title) || /captcha/i.test(title)) return true;
 
-    // Quick body sniff (don’t rely on loaded selectors)
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
     if (
       /enter the characters/i.test(bodyText) ||
@@ -299,7 +298,7 @@ async function isProductPage(page) {
 }
 
 /**
- * Extract all <a> and button-like elements (only used on non-product pages)
+ * Extract all <a> and button-like elements (used on non-product pages)
  */
 async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
   return await page.evaluate((limits) => {
@@ -351,7 +350,7 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
       };
     });
 
-    // Simple de-dupe by (href + text) for links; (text + id) for buttons
+    // Simple de-dupe
     const seenL = new Set();
     const dedupLinks = [];
     for (const l of links) {
@@ -381,7 +380,16 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
 }
 
 /**
- * Scrape product data from DOM
+ * Scrape product data from DOM (Playwright-only fields)
+ * - Title
+ * - Item Form
+ * - Price (ensure currency)
+ * - Featured Bullets (joined with " • ")
+ * - Product Description
+ * - Main Image URL
+ * - Additional Images URLs
+ *
+ * NOTE: Brand is NOT scraped here (Gemini OCR handles brand).
  */
 async function scrapeProductData(page) {
   const title =
@@ -389,12 +397,7 @@ async function scrapeProductData(page) {
     (await page.textContent("#title").catch(() => null));
 
   return await page.evaluate((title) => {
-    const brand = (() => {
-      const byline = document.querySelector("#bylineInfo");
-      if (byline) return byline.textContent.trim();
-      return "";
-    })();
-
+    // -------- Item Form --------
     const itemForm = (() => {
       const li = Array.from(document.querySelectorAll("li")).find((el) =>
         (el.textContent || "").toLowerCase().includes("item form")
@@ -406,16 +409,49 @@ async function scrapeProductData(page) {
       return "";
     })();
 
-    let price = "";
-    const candidates = Array.from(
-      document.querySelectorAll(".a-price .a-offscreen")
-    )
-      .map((el) => (el.textContent || "").trim())
-      .filter((t) => /^\$?\d/.test(t));
-    if (candidates.length) {
-      price = candidates[0];
-    }
+    // -------- Price (ensure currency) --------
+    const getPriceWithCurrency = () => {
+      // Prefer the condensed a-price block
+      const priceEl =
+        document.querySelector(".a-price .a-offscreen") ||
+        document.querySelector("#priceblock_ourprice, #priceblock_dealprice, #priceblock_saleprice");
+      let text = (priceEl?.textContent || "").trim();
 
+      const hasCurrency = /[\p{Sc}]|\b[A-Z]{3}\b/u.test(text);
+      if (text && !hasCurrency) {
+        const sym = document.querySelector(".a-price .a-price-symbol")?.textContent?.trim() || "";
+        if (sym) {
+          text = sym + text;
+        } else {
+          const iso =
+            document
+              .querySelector('meta[property="og:price:currency"]')
+              ?.getAttribute("content") || "";
+          if (iso) text = iso + " " + text;
+        }
+      }
+      return text || "";
+    };
+    const price = getPriceWithCurrency();
+
+    // -------- Featured bullets (joined with " • ") --------
+    const featuredBullets = (() => {
+      const items = Array.from(
+        document.querySelectorAll("#feature-bullets ul li")
+      )
+        .map((li) => (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+      return items.length ? items.join(" • ") : "";
+    })();
+
+    // -------- Product Description --------
+    const productDescription = (() => {
+      const el = document.querySelector("#productDescription");
+      if (!el) return "";
+      return ((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim());
+    })();
+
+    // -------- Images --------
     const mainImageUrl = (() => {
       const imgTag =
         document.querySelector("#landingImage") ||
@@ -429,7 +465,6 @@ async function scrapeProductData(page) {
       if (!url) return "";
       return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
     };
-
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
     // Collect candidate URLs from visible thumbs
@@ -511,27 +546,29 @@ async function scrapeProductData(page) {
 
     return {
       title: (title || "").trim(),
-      brand: brand.trim(),
-      itemForm: itemForm.trim(),
+      itemForm: (itemForm || "").trim(),
       price: (price || "").trim(),
-      mainImageUrl: normalizedMain,
+      featuredBullets: (featuredBullets || "").trim(),
+      productDescription: (productDescription || "").trim(),
+      mainImageUrl: normalizedMain || "",
       additionalImageUrls,
     };
   }, title);
 }
 
 /**
- * Gemini OCR extraction
+ * Gemini OCR extraction (Brand + Price with currency)
  */
 async function geminiExtract(base64Image) {
   const prompt = `
 You are given a screenshot of an Amazon product page.
-Extract JSON with:
-- title
-- brand
-- itemForm
-- price
-Return ONLY valid JSON.`;
+Extract JSON with exactly these keys:
+- brand: string (brand or manufacturer name)
+- price: string (include currency symbol or ISO code, e.g., "$12.99" or "USD 12.99")
+
+Rules:
+- Return ONLY valid minified JSON: {"brand":"...","price":"..."}
+- If a field is unknown or not visible, use "Unspecified".`;
 
   const result = await model.generateContent([
     { text: prompt },
@@ -542,9 +579,14 @@ Return ONLY valid JSON.`;
   text = text.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
 
   try {
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    // normalize keys
+    return {
+      brand: typeof parsed.brand === "string" ? parsed.brand.trim() : "Unspecified",
+      price: typeof parsed.price === "string" ? parsed.price.trim() : "Unspecified",
+    };
   } catch {
-    return { error: "Failed to parse Gemini output", raw: text };
+    return { brand: "Unspecified", price: "Unspecified" };
   }
 }
 
@@ -552,6 +594,28 @@ Return ONLY valid JSON.`;
 app.get("/", (req, res) => {
   res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
 });
+
+function extractASINFromUrl(u = "") {
+  try {
+    const url = new URL(u);
+    const path = url.pathname;
+    const m1 = path.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = path.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
+  } catch {
+    const m1 = u.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
+  }
+}
+
+function includesCurrency(s = "") {
+  return /[\p{Sc}]|\b[A-Z]{3}\b/u.test(s);
+}
+function currencyToken(s = "") {
+  const m = s.match(/([\p{Sc}]|\b[A-Z]{3}\b)/u);
+  return m ? m[1] : "";
+}
 
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
@@ -569,7 +633,6 @@ app.get("/scrape", async (req, res) => {
 
     // Hardened navigation with retry + CAPTCHA detection
     await safeGoto(page, url, { retries: 2, timeout: 60000 });
-
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
     // Dismiss/handle "Continue shopping" and ADOPT new page if Amazon opens one
@@ -587,17 +650,19 @@ app.get("/scrape", async (req, res) => {
       return res.json({
         ok: true,
         pageType: "nonProduct",
+        url,
         meta,
         links,
         buttons,
         counts,
+        screenshot: "", // no screenshot for non-product; change if you want to include
       });
     }
 
     // Small pause to stabilize above-the-fold
     await sleep(jitter(500, 500));
 
-    // Scrape product data
+    // Scrape Playwright data
     const scraped = await scrapeProductData(page);
 
     ensureAlive(page, "Page closed before screenshot");
@@ -606,16 +671,37 @@ app.get("/scrape", async (req, res) => {
     const buf = await safeScreenshot(page, { type: "png" }, 1);
     const base64 = buf.toString("base64");
 
-    // Gemini OCR
-    const geminiData = await geminiExtract(base64);
+    // Gemini OCR for Brand + Price (with currency)
+    const gemini = await geminiExtract(base64);
 
+    // Ensure Gemini price has currency; if missing, borrow from DOM price
+    let priceGemini = gemini.price || "Unspecified";
+    if (!includesCurrency(priceGemini) && includesCurrency(scraped.price)) {
+      const tok = currencyToken(scraped.price);
+      if (tok) priceGemini = `${tok} ${priceGemini}`;
+    }
+    if (!priceGemini.trim()) priceGemini = "Unspecified";
+
+    // ASIN from final resolved URL
+    const resolvedUrl = page.url() || url;
+    const asin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(url);
+
+    // Build final JSON (order chosen for readability)
     res.json({
       ok: true,
-      url,
+      url: resolvedUrl,
       pageType: "product",
-      scrapedData: scraped,
-      geminiOCR: geminiData,
-      screenshot: base64,
+      ASIN: asin || "Unspecified",
+      title: scraped.title || "Unspecified",
+      brand: gemini.brand || "Unspecified",               // Gemini OCR
+      itemForm: scraped.itemForm || "Unspecified",        // Playwright
+      price: scraped.price || "Unspecified",              // Playwright (with currency ensured)
+      priceGemini: priceGemini,                           // Gemini OCR (currency enforced if possible)
+      featuredBullets: scraped.featuredBullets || "Unspecified",
+      productDescription: scraped.productDescription || "Unspecified",
+      mainImageUrl: scraped.mainImageUrl || "Unspecified",
+      additionalImageUrls: scraped.additionalImageUrls || [],
+      screenshot: base64,                                 // base64 PNG
     });
   } catch (err) {
     res.status(500).json({
