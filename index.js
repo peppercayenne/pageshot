@@ -138,6 +138,103 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
 }
 
 /**
+ * Detect & click "Continue shopping" if present, with robust strategies
+ */
+async function clickContinueShoppingIfPresent(page) {
+  // try known selectors first (common on Amazon)
+  const KNOWN_SELECTORS = [
+    '#hlb-continue-shopping-announce',      // mini-cart layer
+    'a#hlb-continue-shopping-announce',
+    '#continue-shopping',                   // generic id variants
+    'button#continue-shopping',
+    'a[href*="continueShopping"]',
+    'button[name*="continueShopping"]',
+    'input[type="submit"][value*="Continue shopping" i]',
+    '#attach-close_sideSheet-link',         // side sheet close (returns to page)
+  ];
+
+  for (const sel of KNOWN_SELECTORS) {
+    try {
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 500 }).catch(() => false)) {
+        await el.click({ timeout: 2000 }).catch(() => {});
+        return true;
+      }
+    } catch {}
+  }
+
+  // generic text search (buttons/links/role=button)
+  try {
+    const textLoc = page.locator(
+      'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping")'
+    );
+    if (await textLoc.first().isVisible({ timeout: 500 }).catch(() => false)) {
+      await textLoc.first().click({ timeout: 2000 }).catch(() => {});
+      return true;
+    }
+  } catch {}
+
+  // final fallback: DOM scan + click via evaluate
+  try {
+    const clicked = await page.evaluate(() => {
+      const nodes = Array.from(
+        document.querySelectorAll('button, a, input[type="submit"], div[role="button"]')
+      );
+      const target = nodes.find((n) => {
+        const txt = ((n.innerText || n.value || "") + "").toLowerCase();
+        return txt.includes("continue shopping");
+      });
+      if (target) {
+        target.scrollIntoView?.({ block: "center", inline: "center" });
+        (target).click();
+        return true;
+      }
+      return false;
+    });
+    if (clicked) return true;
+  } catch {}
+
+  return false;
+}
+
+/**
+ * Handle "Continue shopping" interstitials:
+ * 1) click if present
+ * 2) wait for quick nav/load
+ * 3) if still present, reload once
+ */
+async function handleContinueShopping(page) {
+  const clicked = await clickContinueShoppingIfPresent(page);
+  if (!clicked) return false;
+
+  // wait briefly for nav/load
+  try {
+    await Promise.race([
+      page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }),
+      page.waitForLoadState("domcontentloaded", { timeout: 15000 }),
+    ]);
+  } catch {}
+
+  // if the button still appears, reload once
+  try {
+    const stillThere = await page.evaluate(() => {
+      const nodes = Array.from(
+        document.querySelectorAll('button, a, input[type="submit"], div[role="button"]')
+      );
+      return nodes.some((n) =>
+        ((n.innerText || n.value || "") + "").toLowerCase().includes("continue shopping")
+      );
+    });
+    if (stillThere) {
+      await page.reload({ timeout: 20000, waitUntil: "commit" }).catch(() => {});
+      await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+    }
+  } catch {}
+
+  return true;
+}
+
+/**
  * Safer screenshot with a small retry
  */
 async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
@@ -360,6 +457,10 @@ app.get("/scrape", async (req, res) => {
     await safeGoto(page, url, { retries: 2, timeout: 60000 });
 
     ensureAlive(page, "Page unexpectedly closed after navigation");
+
+    // Dismiss "Continue shopping" interstitials if present
+    await handleContinueShopping(page);
+    ensureAlive(page, "Page closed after continue-shopping handling");
 
     // One small, bounded wait to let above-the-fold content stabilize
     await sleep(jitter(500, 500));
