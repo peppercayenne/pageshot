@@ -618,6 +618,62 @@ function currencyToken(s = "") {
   return m ? m[1] : "";
 }
 
+/**
+ * Normalize Gemini price strings:
+ * - Convert superscripts/subscripts ⁰-⁹ / ₀-₉ to normal digits
+ * - If superscripts were present and no decimal, insert dot before last two digits
+ * - Turn "34,95" or "34 95" into "34.95"
+ * - Preserve or borrow currency (symbol or ISO) if missing
+ */
+function normalizeGeminiPrice(raw = "", domPrice = "") {
+  let s = (raw || "").trim();
+  if (!s) return "Unspecified";
+
+  // Normalize spaces
+  s = s.replace(/[\u00A0\u2009\u202F]/g, " ");
+
+  const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]/.test(s);
+
+  // Map superscript/subscript digits to normal digits
+  const map = {
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+  };
+  s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
+
+  // If comma used as decimal: 34,95 -> 34.95 (only when no dot present)
+  if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) {
+    s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
+  }
+  // If space between cents: 34 95 -> 34.95 (only when no dot present)
+  if (!/\d\.\d{2,}/.test(s) && /(\d+)\s+(\d{2})\b/.test(s)) {
+    s = s.replace(/(\d+)\s+(\d{2})\b/, "$1.$2");
+  }
+
+  // If superscripts were present and there's still no decimal, insert before last 2 digits
+  if (hadSuper && !/\d\.\d{2,}/.test(s)) {
+    const digits = (s.match(/\d+/g) || []).join("");
+    if (digits.length >= 3) {
+      const num = `${digits.slice(0, -2)}.${digits.slice(-2)}`;
+      // Keep any currency token from s (symbol or ISO), else from domPrice
+      const cur = currencyToken(s) || currencyToken(domPrice);
+      s = cur ? `${cur} ${num}` : num;
+    }
+  }
+
+  // If still missing currency but DOM has it, borrow
+  if (!includesCurrency(s) && includesCurrency(domPrice)) {
+    const cur = currencyToken(domPrice);
+    if (cur) s = `${cur} ${s}`;
+  }
+
+  // Collapse extra spaces
+  s = s.replace(/\s+/g, " ").trim();
+  return s || "Unspecified";
+}
+
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
@@ -677,13 +733,8 @@ app.get("/scrape", async (req, res) => {
     // Gemini OCR for Brand + Price (with currency)
     const gemini = await geminiExtract(base64);
 
-    // Ensure Gemini price has currency; if missing, borrow from DOM price
-    let priceGemini = gemini.price || "Unspecified";
-    if (!includesCurrency(priceGemini) && includesCurrency(scraped.price)) {
-      const tok = currencyToken(scraped.price);
-      if (tok) priceGemini = `${tok} ${priceGemini}`;
-    }
-    if (!priceGemini.trim()) priceGemini = "Unspecified";
+    // Normalize Gemini price (fix superscripts etc.), borrowing currency from DOM if needed
+    let priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
 
     // ASIN from final resolved URL
     const resolvedUrl = page.url() || url;
@@ -699,7 +750,7 @@ app.get("/scrape", async (req, res) => {
       brand: gemini.brand || "Unspecified",               // Gemini OCR
       itemForm: scraped.itemForm || "Unspecified",        // Playwright
       price: scraped.price || "Unspecified",              // Playwright (with currency ensured)
-      priceGemini: priceGemini,                           // Gemini OCR (currency enforced if possible)
+      priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
       featuredBullets: scraped.featuredBullets || "Unspecified",
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
