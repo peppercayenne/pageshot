@@ -52,7 +52,8 @@ async function minimalContext(width, height) {
     "accept-language": "en-US,en;q=0.9",
   });
 
-  return { browser, page };
+  // Return context so we can adopt new pages/popups later
+  return { browser, context, page };
 }
 
 /**
@@ -62,9 +63,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
 
 function ensureAlive(page, msg = "Page is closed") {
-  if (!page || page.isClosed()) {
-    throw new Error(msg);
-  }
+  if (!page || page.isClosed()) throw new Error(msg);
 }
 
 function isRobotCheckUrl(url) {
@@ -184,34 +183,63 @@ async function clickContinueShoppingIfPresent(page) {
   return false;
 }
 
-async function handleContinueShopping(page) {
+/**
+ * Handle "Continue shopping" flows and ADOPT a new page if one opens
+ * Returns the active page (may be a different Page instance)
+ */
+async function handleContinueShopping(page, context) {
   const clicked = await clickContinueShoppingIfPresent(page);
-  if (!clicked) return false;
+  if (!clicked) return page;
 
-  try {
-    await Promise.race([
-      page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }),
-      page.waitForLoadState("domcontentloaded", { timeout: 15000 }),
-    ]);
-  } catch {}
+  // Wait for either navigation or a popup/new page
+  const popupPromise = context
+    .waitForEvent("page", { timeout: 8000 })
+    .catch(() => null);
+  const navPromise = page
+    .waitForNavigation({ timeout: 15000, waitUntil: "commit" })
+    .catch(() => null);
+  const dclPromise = page
+    .waitForLoadState("domcontentloaded", { timeout: 15000 })
+    .catch(() => null);
 
-  // if the button still appears, reload once
+  await Promise.race([popupPromise, navPromise, dclPromise]);
+
+  // Prefer a newly opened, alive page that is not about:blank
+  const pages = context.pages();
+  const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
+  if (active && active !== page) {
+    await active.bringToFront().catch(() => {});
+    return active;
+  }
+
+  // If the current page died, fallback to any alive page
+  if (page.isClosed()) {
+    const fallback = pages.find((p) => !p.isClosed());
+    if (fallback) return fallback;
+    throw new Error("Page closed after continue-shopping handling");
+  }
+
+  // If the button still appears, reload once
   try {
     const stillThere = await page.evaluate(() => {
       const nodes = Array.from(
         document.querySelectorAll('button, a, input[type="submit"], div[role="button"]')
       );
       return nodes.some((n) =>
-        ((n.innerText || n.value || "") + "").toLowerCase().includes("continue shopping")
+        ((n.innerText || n.value || "") + "")
+          .toLowerCase()
+          .includes("continue shopping")
       );
     });
     if (stillThere) {
       await page.reload({ timeout: 20000, waitUntil: "commit" }).catch(() => {});
-      await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+      await page
+        .waitForLoadState("domcontentloaded", { timeout: 10000 })
+        .catch(() => {});
     }
   } catch {}
 
-  return true;
+  return page;
 }
 
 /**
@@ -241,13 +269,13 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
 
 /**
  * Heuristic: are we on a proper Amazon product page?
- * Checks URL patterns + canonical + key DOM elements.
  */
 async function isProductPage(page) {
   try {
     return await page.evaluate(() => {
       const url = location.href;
-      const canonical = document.querySelector('link[rel="canonical"]')?.href || "";
+      const canonical =
+        document.querySelector('link[rel="canonical"]')?.href || "";
       const urlFlag =
         /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(url) ||
         /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(canonical);
@@ -272,7 +300,6 @@ async function isProductPage(page) {
 
 /**
  * Extract all <a> and button-like elements (only used on non-product pages)
- * Returns compact metadata and absolute hrefs.
  */
 async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
   return await page.evaluate((limits) => {
@@ -315,8 +342,12 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
         role: el.getAttribute("role") || "",
         ariaLabel: el.getAttribute("aria-label") || "",
         onclick: el.getAttribute("onclick") || "",
-        // if it's actually an <a role="button"> we also expose href
-        href: tag === "a" ? toAbs(el.getAttribute("href")) : (el.getAttribute("href") ? toAbs(el.getAttribute("href")) : ""),
+        href:
+          tag === "a"
+            ? toAbs(el.getAttribute("href"))
+            : el.getAttribute("href")
+            ? toAbs(el.getAttribute("href"))
+            : "",
       };
     });
 
@@ -341,7 +372,11 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
       }
     }
 
-    return { links: dedupLinks, buttons: dedupButtons, counts: { links: links.length, buttons: buttons.length } };
+    return {
+      links: dedupLinks,
+      buttons: dedupButtons,
+      counts: { links: links.length, buttons: buttons.length },
+    };
   }, limits);
 }
 
@@ -405,7 +440,7 @@ async function scrapeProductData(page) {
       .map((src) => (src || "").trim())
       .filter(Boolean);
 
-    // Also inspect landing image attributes (Amazon often hides best URLs here)
+    // Also inspect landing image attributes
     const landing =
       document.querySelector("#landingImage") ||
       document.querySelector("#imgTagWrapperId img");
@@ -446,7 +481,7 @@ async function scrapeProductData(page) {
       )
     ).map((m) => m[0]);
 
-    // Merge, dedupe early (keep raw variants before filtering)
+    // Merge, dedupe early
     additionalImageUrls = [...new Set([...additionalImageUrls, ...hiResMatches])];
 
     // Remove obvious junk thumbs/sprites/overlays
@@ -465,13 +500,13 @@ async function scrapeProductData(page) {
 
     // Final pass:
     // 1) Remove main image if present (base jpg)
-    // 2) Keep ANY AC_SL size (e.g., _AC_SL1000_, _AC_SL1500_, _AC_SL2000_, etc.)
+    // 2) Keep ANY AC_SL size (_AC_SL1000_, _AC_SL1500_, _AC_SL2000_, etc.)
     const AC_ANY = /\._AC_SL\d+_\.jpg(?:\?.*)?$/i;
     additionalImageUrls = additionalImageUrls
       .filter((url) => url && url !== normalizedMain)
       .filter((url) => AC_ANY.test(url));
 
-    // Dedupe again in case filters created dupes
+    // Dedupe again
     additionalImageUrls = [...new Set(additionalImageUrls)];
 
     return {
@@ -522,13 +557,14 @@ app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
 
-  const width = 1280, height = 800;
+  const width = 1280,
+    height = 800;
 
-  let browser;
-  let page;
+  let browser, context, page;
   try {
     const ctx = await minimalContext(width, height);
     browser = ctx.browser;
+    context = ctx.context;
     page = ctx.page;
 
     // Hardened navigation with retry + CAPTCHA detection
@@ -536,11 +572,11 @@ app.get("/scrape", async (req, res) => {
 
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Dismiss "Continue shopping" interstitials if present
-    await handleContinueShopping(page);
+    // Dismiss/handle "Continue shopping" and ADOPT new page if Amazon opens one
+    page = await handleContinueShopping(page, context);
     ensureAlive(page, "Page closed after continue-shopping handling");
 
-    // Check if this is a proper product page; if not, extract links/buttons instead
+    // If not a product page, return list of links/buttons instead of scraping
     const productLike = await isProductPage(page);
     if (!productLike) {
       const meta = {
@@ -558,10 +594,10 @@ app.get("/scrape", async (req, res) => {
       });
     }
 
-    // One small, bounded wait to let above-the-fold content stabilize
+    // Small pause to stabilize above-the-fold
     await sleep(jitter(500, 500));
 
-    // Scraping
+    // Scrape product data
     const scraped = await scrapeProductData(page);
 
     ensureAlive(page, "Page closed before screenshot");
@@ -587,8 +623,13 @@ app.get("/scrape", async (req, res) => {
       error: err?.message || String(err),
     });
   } finally {
+    // Close all pages in context to avoid leaks if a popup was opened
     try {
-      if (page && !page.isClosed()) await page.close({ runBeforeUnload: false });
+      for (const p of context?.pages?.() || []) {
+        try {
+          if (!p.isClosed()) await p.close({ runBeforeUnload: false });
+        } catch {}
+      }
     } catch {}
     try {
       await browser?.close();
