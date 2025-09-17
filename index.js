@@ -93,9 +93,7 @@ async function looksBlocked(page) {
     ) {
       return true;
     }
-  } catch {
-    // ignore and treat as not blocked
-  }
+  } catch {}
   return false;
 }
 
@@ -111,25 +109,17 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
 
   while (attempt <= retries) {
     try {
-      // slight random delay before navigating to reduce burst patterns
-      await sleep(jitter(250, 500));
-
+      await sleep(jitter(250, 500)); // slight jitter
       await page.goto(url, { timeout, waitUntil: "commit" });
+      await sleep(jitter(700, 600)); // let initial HTML render
 
-      // give the DOM a moment to render initial HTML
-      await sleep(jitter(700, 600));
-
-      // Block/robot check detection
       if (await looksBlocked(page)) {
         throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
       }
-
       return; // success
     } catch (err) {
       lastErr = err;
       if (page.isClosed()) throw lastErr;
-
-      // backoff before retrying (1s..2.5s jitter)
       if (attempt < retries) await sleep(jitter(1000, 1500));
       attempt++;
     }
@@ -138,19 +128,18 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
 }
 
 /**
- * Detect & click "Continue shopping" if present, with robust strategies
+ * Detect & click "Continue shopping" if present
  */
 async function clickContinueShoppingIfPresent(page) {
-  // try known selectors first (common on Amazon)
   const KNOWN_SELECTORS = [
-    '#hlb-continue-shopping-announce',      // mini-cart layer
+    '#hlb-continue-shopping-announce',
     'a#hlb-continue-shopping-announce',
-    '#continue-shopping',                   // generic id variants
+    '#continue-shopping',
     'button#continue-shopping',
     'a[href*="continueShopping"]',
     'button[name*="continueShopping"]',
     'input[type="submit"][value*="Continue shopping" i]',
-    '#attach-close_sideSheet-link',         // side sheet close (returns to page)
+    '#attach-close_sideSheet-link',
   ];
 
   for (const sel of KNOWN_SELECTORS) {
@@ -163,7 +152,6 @@ async function clickContinueShoppingIfPresent(page) {
     } catch {}
   }
 
-  // generic text search (buttons/links/role=button)
   try {
     const textLoc = page.locator(
       'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping")'
@@ -174,7 +162,6 @@ async function clickContinueShoppingIfPresent(page) {
     }
   } catch {}
 
-  // final fallback: DOM scan + click via evaluate
   try {
     const clicked = await page.evaluate(() => {
       const nodes = Array.from(
@@ -186,7 +173,7 @@ async function clickContinueShoppingIfPresent(page) {
       });
       if (target) {
         target.scrollIntoView?.({ block: "center", inline: "center" });
-        (target).click();
+        target.click();
         return true;
       }
       return false;
@@ -197,17 +184,10 @@ async function clickContinueShoppingIfPresent(page) {
   return false;
 }
 
-/**
- * Handle "Continue shopping" interstitials:
- * 1) click if present
- * 2) wait for quick nav/load
- * 3) if still present, reload once
- */
 async function handleContinueShopping(page) {
   const clicked = await clickContinueShoppingIfPresent(page);
   if (!clicked) return false;
 
-  // wait briefly for nav/load
   try {
     await Promise.race([
       page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }),
@@ -246,7 +226,6 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
     } catch (err) {
       lastErr = err;
       const msg = (err && err.message) || String(err);
-      // If the page/context/browser was closed, don't retry further
       if (/Target page, context or browser has been closed/i.test(msg)) {
         throw new Error("Screenshot failed: " + msg);
       }
@@ -258,6 +237,112 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
     }
   }
   throw lastErr || new Error("Screenshot failed");
+}
+
+/**
+ * Heuristic: are we on a proper Amazon product page?
+ * Checks URL patterns + canonical + key DOM elements.
+ */
+async function isProductPage(page) {
+  try {
+    return await page.evaluate(() => {
+      const url = location.href;
+      const canonical = document.querySelector('link[rel="canonical"]')?.href || "";
+      const urlFlag =
+        /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(url) ||
+        /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(canonical);
+
+      const hasTitle =
+        !!document.querySelector("#productTitle") ||
+        !!document.querySelector("#titleSection #title");
+      const hasByline = !!document.querySelector("#bylineInfo");
+      const hasBuyCtas =
+        !!document.querySelector("#add-to-cart-button, input#add-to-cart-button") ||
+        !!document.querySelector("#buy-now-button, input#buy-now-button");
+
+      const layoutHints =
+        !!document.querySelector("#dp, #dp-container, #ppd, #centerCol, #leftCol");
+
+      return (urlFlag && hasTitle && layoutHints) || ((hasTitle || hasByline) && hasBuyCtas);
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Extract all <a> and button-like elements (only used on non-product pages)
+ * Returns compact metadata and absolute hrefs.
+ */
+async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
+  return await page.evaluate((limits) => {
+    const toAbs = (u) => {
+      try {
+        return u ? new URL(u, location.href).href : "";
+      } catch {
+        return u || "";
+      }
+    };
+    const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+    const linkNodes = Array.from(document.querySelectorAll("a"));
+    const btnNodes = Array.from(
+      document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]')
+    );
+
+    const links = linkNodes.slice(0, limits.maxLinks).map((el) => ({
+      tag: "a",
+      text: clean(el.innerText || el.textContent || ""),
+      href: toAbs(el.getAttribute("href")),
+      id: el.id || "",
+      classes: clean(el.className || ""),
+      rel: el.getAttribute("rel") || "",
+      target: el.getAttribute("target") || "",
+      role: el.getAttribute("role") || "",
+      ariaLabel: el.getAttribute("aria-label") || "",
+      onclick: el.getAttribute("onclick") || "",
+    }));
+
+    const buttons = btnNodes.slice(0, limits.maxButtons).map((el) => {
+      const tag = (el.tagName || "").toLowerCase();
+      return {
+        tag,
+        text: clean(el.innerText || el.value || el.textContent || ""),
+        id: el.id || "",
+        classes: clean(el.className || ""),
+        name: el.getAttribute("name") || "",
+        type: el.getAttribute("type") || "",
+        role: el.getAttribute("role") || "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        onclick: el.getAttribute("onclick") || "",
+        // if it's actually an <a role="button"> we also expose href
+        href: tag === "a" ? toAbs(el.getAttribute("href")) : (el.getAttribute("href") ? toAbs(el.getAttribute("href")) : ""),
+      };
+    });
+
+    // Simple de-dupe by (href + text) for links; (text + id) for buttons
+    const seenL = new Set();
+    const dedupLinks = [];
+    for (const l of links) {
+      const k = `${l.href}|${l.text}`;
+      if (l.href && !seenL.has(k)) {
+        seenL.add(k);
+        dedupLinks.push(l);
+      }
+    }
+
+    const seenB = new Set();
+    const dedupButtons = [];
+    for (const b of buttons) {
+      const k = `${b.text}|${b.id}`;
+      if (!seenB.has(k)) {
+        seenB.add(k);
+        dedupButtons.push(b);
+      }
+    }
+
+    return { links: dedupLinks, buttons: dedupButtons, counts: { links: links.length, buttons: buttons.length } };
+  }, limits);
 }
 
 /**
@@ -333,23 +418,17 @@ async function scrapeProductData(page) {
       const dyn = landing.getAttribute("data-a-dynamic-image");
       if (dyn) {
         try {
-          // Already JSON in most cases; if HTML-escaped, unescape quotes
           const clean = dyn.replace(/&quot;/g, '"');
           const obj = JSON.parse(clean);
-          for (const k of Object.keys(obj || {})) {
-            fromLandingAttrs.push(k);
-          }
+          for (const k of Object.keys(obj || {})) fromLandingAttrs.push(k);
         } catch {
-          // fallback for single-quoted JSON-like strings
           try {
             const clean2 = dyn
               .replace(/&quot;/g, '"')
-              .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":') // keys
-              .replace(/:\s*'([^']+?)'(\s*[},])/g, ':"$1"$2'); // values
+              .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
+              .replace(/:\s*'([^']+?)'(\s*[},])/g, ':"$1"$2');
             const obj2 = JSON.parse(clean2);
-            for (const k of Object.keys(obj2 || {})) {
-              fromLandingAttrs.push(k);
-            }
+            for (const k of Object.keys(obj2 || {})) fromLandingAttrs.push(k);
           } catch {}
         }
       }
@@ -443,8 +522,7 @@ app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
 
-  const width = 1280,
-    height = 800;
+  const width = 1280, height = 800;
 
   let browser;
   let page;
@@ -461,6 +539,24 @@ app.get("/scrape", async (req, res) => {
     // Dismiss "Continue shopping" interstitials if present
     await handleContinueShopping(page);
     ensureAlive(page, "Page closed after continue-shopping handling");
+
+    // Check if this is a proper product page; if not, extract links/buttons instead
+    const productLike = await isProductPage(page);
+    if (!productLike) {
+      const meta = {
+        currentUrl: page.url(),
+        title: (await page.title().catch(() => "")) || "",
+      };
+      const { links, buttons, counts } = await extractLinksAndButtons(page);
+      return res.json({
+        ok: true,
+        pageType: "nonProduct",
+        meta,
+        links,
+        buttons,
+        counts,
+      });
+    }
 
     // One small, bounded wait to let above-the-fold content stabilize
     await sleep(jitter(500, 500));
@@ -480,6 +576,7 @@ app.get("/scrape", async (req, res) => {
     res.json({
       ok: true,
       url,
+      pageType: "product",
       scrapedData: scraped,
       geminiOCR: geminiData,
       screenshot: base64,
@@ -490,7 +587,6 @@ app.get("/scrape", async (req, res) => {
       error: err?.message || String(err),
     });
   } finally {
-    // Always try to close, ignoring errors
     try {
       if (page && !page.isClosed()) await page.close({ runBeforeUnload: false });
     } catch {}
