@@ -384,7 +384,7 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
  * - Title
  * - Item Form
  * - Price (ensure currency)
- * - Featured Bullets (joined with " • ")
+ * - Featured Bullets (each "• text ")
  * - Product Description
  * - Main Image URL
  * - Additional Images URLs
@@ -411,7 +411,6 @@ async function scrapeProductData(page) {
 
     // -------- Price (ensure currency) --------
     const getPriceWithCurrency = () => {
-      // Prefer the condensed a-price block
       const priceEl =
         document.querySelector(".a-price .a-offscreen") ||
         document.querySelector("#priceblock_ourprice, #priceblock_dealprice, #priceblock_saleprice");
@@ -434,21 +433,24 @@ async function scrapeProductData(page) {
     };
     const price = getPriceWithCurrency();
 
-    // -------- Featured bullets (joined with " • ") --------
+    // -------- Featured bullets (each item prefixed with "• " and suffixed with " ") --------
     const featuredBullets = (() => {
       const items = Array.from(
         document.querySelectorAll("#feature-bullets ul li")
       )
-        .map((li) => (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim())
-        .filter(Boolean);
-      return items.length ? items.join(" • ") : "";
+        .map((li) =>
+          (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim()
+        )
+        .filter(Boolean)
+        .map((text) => `• ${text} `); // bullet at start, space at end
+      return items.length ? items.join("") : "";
     })();
 
     // -------- Product Description --------
     const productDescription = (() => {
       const el = document.querySelector("#productDescription");
       if (!el) return "";
-      return ((el.innerText || el.textContent || "").replace(/\s+/g, " ").trim());
+      return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
     })();
 
     // -------- Images --------
@@ -580,7 +582,6 @@ Rules:
 
   try {
     const parsed = JSON.parse(text);
-    // normalize keys
     return {
       brand: typeof parsed.brand === "string" ? parsed.brand.trim() : "Unspecified",
       price: typeof parsed.price === "string" ? parsed.price.trim() : "Unspecified",
@@ -621,8 +622,7 @@ app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
 
-  const width = 1280,
-    height = 800;
+  const width = 1280, height = 800;
 
   let browser, context, page;
   try {
@@ -639,9 +639,13 @@ app.get("/scrape", async (req, res) => {
     page = await handleContinueShopping(page, context);
     ensureAlive(page, "Page closed after continue-shopping handling");
 
-    // If not a product page, return list of links/buttons instead of scraping
+    // Product page or not?
     const productLike = await isProductPage(page);
+
+    // If NOT a product page: capture screenshot, extract links/buttons, return.
     if (!productLike) {
+      const bufNP = await safeScreenshot(page, { type: "png" }, 1);
+      const base64NP = bufNP.toString("base64");
       const meta = {
         currentUrl: page.url(),
         title: (await page.title().catch(() => "")) || "",
@@ -649,13 +653,13 @@ app.get("/scrape", async (req, res) => {
       const { links, buttons, counts } = await extractLinksAndButtons(page);
       return res.json({
         ok: true,
+        url: meta.currentUrl,
         pageType: "nonProduct",
-        url,
+        screenshot: base64NP,
         meta,
         links,
         buttons,
         counts,
-        screenshot: "", // no screenshot for non-product; change if you want to include
       });
     }
 
@@ -664,7 +668,6 @@ app.get("/scrape", async (req, res) => {
 
     // Scrape Playwright data
     const scraped = await scrapeProductData(page);
-
     ensureAlive(page, "Page closed before screenshot");
 
     // Screenshot for OCR (with a small retry)
@@ -686,7 +689,7 @@ app.get("/scrape", async (req, res) => {
     const resolvedUrl = page.url() || url;
     const asin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(url);
 
-    // Build final JSON (order chosen for readability)
+    // Final JSON
     res.json({
       ok: true,
       url: resolvedUrl,
@@ -701,7 +704,7 @@ app.get("/scrape", async (req, res) => {
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
-      screenshot: base64,                                 // base64 PNG
+      screenshot: base64,                                  // base64 PNG
     });
   } catch (err) {
     res.status(500).json({
