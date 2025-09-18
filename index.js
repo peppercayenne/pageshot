@@ -75,6 +75,29 @@ function ensureAlive(page, msg = "Page is closed") {
   if (!page || page.isClosed()) throw new Error(msg);
 }
 
+function isClosedErr(err) {
+  const msg = (err && err.message) || String(err || "");
+  return /Target page, context or browser has been closed/i.test(msg);
+}
+
+async function adoptActivePageOrThrow(currentPage, context) {
+  // If current page still alive, keep it
+  if (currentPage && !currentPage.isClosed()) return currentPage;
+  // Else adopt the most recent alive page that isn't about:blank
+  const pages = context.pages().filter((p) => !p.isClosed());
+  // Prefer the last opened page
+  for (let i = pages.length - 1; i >= 0; i--) {
+    const p = pages[i];
+    if (p.url() !== "about:blank") {
+      try { await p.bringToFront(); } catch {}
+      return p;
+    }
+  }
+  // As a last resort, return any alive page
+  if (pages[0]) return pages[0];
+  throw new Error("All pages are closed");
+}
+
 function isRobotCheckUrl(url) {
   if (!url) return false;
   return (
@@ -390,14 +413,6 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
 
 /**
  * Scrape product data from DOM (Playwright-only fields)
- * - Title
- * - Item Form
- * - Price (ensure currency)
- * - Featured Bullets (each "• text ")
- * - Product Description
- * - Main Image URL
- * - Additional Images URLs
- *
  * NOTE: Brand is NOT scraped here (Gemini OCR handles brand).
  */
 async function scrapeProductData(page) {
@@ -628,11 +643,7 @@ function currencyToken(s = "") {
 }
 
 /**
- * Normalize Gemini price strings:
- * - Convert superscripts/subscripts ⁰-⁹ / ₀-₉ to normal digits
- * - If superscripts were present and no decimal, insert dot before last two digits
- * - Turn "34,95" or "34 95" into "34.95"
- * - Preserve or borrow currency (symbol or ISO) if missing
+ * Normalize Gemini price strings (fix superscripts, etc.)
  */
 function normalizeGeminiPrice(raw = "", domPrice = "") {
   let s = (raw || "").trim();
@@ -666,7 +677,6 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
     const digits = (s.match(/\d+/g) || []).join("");
     if (digits.length >= 3) {
       const num = `${digits.slice(0, -2)}.${digits.slice(-2)}`;
-      // Keep any currency token from s (symbol or ISO), else from domPrice
       const cur = currencyToken(s) || currencyToken(domPrice);
       s = cur ? `${cur} ${num}` : num;
     }
@@ -687,8 +697,7 @@ app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
 
-  const width = 1280,
-    height = 800;
+  const width = 1280, height = 800;
 
   let browser, context, page;
   try {
@@ -705,18 +714,43 @@ app.get("/scrape", async (req, res) => {
     page = await handleContinueShopping(page, context);
     ensureAlive(page, "Page closed after continue-shopping handling");
 
-    // Product page or not?
-    const productLike = await isProductPage(page);
+    // Product page or not? (retry if page closed)
+    let productLike;
+    try {
+      productLike = await isProductPage(page);
+    } catch (e) {
+      if (isClosedErr(e)) {
+        page = await adoptActivePageOrThrow(page, context);
+        await sleep(200);
+        productLike = await isProductPage(page);
+      } else {
+        throw e;
+      }
+    }
 
     // If NOT a product page: capture screenshot, extract links/buttons, return.
     if (!productLike) {
-      const bufNP = await safeScreenshot(page, { type: "png" }, 1);
+      let bufNP;
+      try {
+        bufNP = await safeScreenshot(page, { type: "png" }, 1);
+      } catch (e) {
+        if (isClosedErr(e)) {
+          page = await adoptActivePageOrThrow(page, context);
+          bufNP = await safeScreenshot(page, { type: "png" }, 1);
+        } else {
+          throw e;
+        }
+      }
       const base64NP = bufNP.toString("base64");
       const meta = {
         currentUrl: page.url(),
         title: (await page.title().catch(() => "")) || "",
       };
-      const { links, buttons, counts } = await extractLinksAndButtons(page);
+      const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({
+        links: [],
+        buttons: [],
+        counts: { links: 0, buttons: 0 },
+      }));
       return res.json({
         ok: true,
         url: meta.currentUrl,
@@ -730,14 +764,36 @@ app.get("/scrape", async (req, res) => {
     }
 
     // Small pause to stabilize above-the-fold
-    await sleep(jitter(500, 500));
+    await sleep(jitter(300, 400));
 
-    // Scrape Playwright data
-    const scraped = await scrapeProductData(page);
+    // Scrape Playwright data (retry if page closed mid-evaluate)
+    let scraped;
+    try {
+      scraped = await scrapeProductData(page);
+    } catch (e) {
+      if (isClosedErr(e)) {
+        page = await adoptActivePageOrThrow(page, context);
+        await sleep(200);
+        scraped = await scrapeProductData(page);
+      } else {
+        throw e;
+      }
+    }
+
     ensureAlive(page, "Page closed before screenshot");
 
-    // Screenshot for OCR (with a small retry)
-    const buf = await safeScreenshot(page, { type: "png" }, 1);
+    // Screenshot for OCR (with retry + adopt)
+    let buf;
+    try {
+      buf = await safeScreenshot(page, { type: "png" }, 1);
+    } catch (e) {
+      if (isClosedErr(e)) {
+        page = await adoptActivePageOrThrow(page, context);
+        buf = await safeScreenshot(page, { type: "png" }, 1);
+      } else {
+        throw e;
+      }
+    }
     const base64 = buf.toString("base64");
 
     // Gemini OCR for Brand + Price (with currency)
@@ -757,15 +813,15 @@ app.get("/scrape", async (req, res) => {
       pageType: "product",
       ASIN: asin || "Unspecified",
       title: scraped.title || "Unspecified",
-      brand: gemini.brand || "Unspecified", // Gemini OCR
-      itemForm: scraped.itemForm || "Unspecified", // Playwright
-      price: scraped.price || "Unspecified", // Playwright (with currency ensured)
-      priceGemini: priceGemini || "Unspecified", // Gemini OCR normalized
+      brand: gemini.brand || "Unspecified",               // Gemini OCR
+      itemForm: scraped.itemForm || "Unspecified",        // Playwright
+      price: scraped.price || "Unspecified",              // Playwright (with currency ensured)
+      priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
       featuredBullets: scraped.featuredBullets || "Unspecified",
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
-      screenshot: base64, // base64 PNG
+      screenshot: base64,                                  // base64 PNG
     });
   } catch (err) {
     res.status(500).json({
