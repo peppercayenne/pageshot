@@ -85,7 +85,6 @@ async function adoptActivePageOrThrow(currentPage, context) {
   if (currentPage && !currentPage.isClosed()) return currentPage;
   // Else adopt the most recent alive page that isn't about:blank
   const pages = context.pages().filter((p) => !p.isClosed());
-  // Prefer the last opened page
   for (let i = pages.length - 1; i >= 0; i--) {
     const p = pages[i];
     if (p.url() !== "about:blank") {
@@ -93,7 +92,6 @@ async function adoptActivePageOrThrow(currentPage, context) {
       return p;
     }
   }
-  // As a last resort, return any alive page
   if (pages[0]) return pages[0];
   throw new Error("All pages are closed");
 }
@@ -129,9 +127,6 @@ async function looksBlocked(page) {
 
 /**
  * Navigation with retry + CAPTCHA detection
- * - waitUntil: 'commit' to avoid long loads
- * - timeout: 60s
- * - retries: 2 (total 3 attempts)
  */
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let attempt = 0;
@@ -158,9 +153,43 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
 }
 
 /**
- * Detect & click "Continue shopping" if present
+ * Close the "Added to Cart" side sheet if visible
+ */
+async function closeAttachSideSheetIfVisible(page) {
+  try {
+    const closed = await page.evaluate(() => {
+      const q = (sel) => document.querySelector(sel);
+      const candidates = [
+        "#attach-close_sideSheet-link",
+        ".a-button-close",
+        ".a-popover-header .a-icon-close",
+        'button[aria-label="Close"]',
+        'button[aria-label="Close dialog"]',
+      ];
+      for (const sel of candidates) {
+        const el = q(sel);
+        if (el && getComputedStyle(el).display !== "none" && !el.disabled) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    return !!closed;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Detect & click "Continue/Keep shopping" if present
  */
 async function clickContinueShoppingIfPresent(page) {
+  // First: try closing side sheet if present
+  if (await closeAttachSideSheetIfVisible(page)) {
+    return true; // closing it usually returns to product page
+  }
+
   const KNOWN_SELECTORS = [
     '#hlb-continue-shopping-announce',
     'a#hlb-continue-shopping-announce',
@@ -169,6 +198,9 @@ async function clickContinueShoppingIfPresent(page) {
     'a[href*="continueShopping"]',
     'button[name*="continueShopping"]',
     'input[type="submit"][value*="Continue shopping" i]',
+    'input[type="submit"][value*="Keep shopping" i]',
+    'a:has-text("Keep shopping")',
+    'button:has-text("Keep shopping")',
     '#attach-close_sideSheet-link',
   ];
 
@@ -184,7 +216,7 @@ async function clickContinueShoppingIfPresent(page) {
 
   try {
     const textLoc = page.locator(
-      'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping")'
+      'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping"), button:has-text("Keep shopping"), a:has-text("Keep shopping")'
     );
     if (await textLoc.first().isVisible({ timeout: 500 }).catch(() => false)) {
       await textLoc.first().click({ timeout: 2000 }).catch(() => {});
@@ -199,7 +231,7 @@ async function clickContinueShoppingIfPresent(page) {
       );
       const target = nodes.find((n) => {
         const txt = ((n.innerText || n.value || "") + "").toLowerCase();
-        return txt.includes("continue shopping");
+        return txt.includes("continue shopping") || txt.includes("keep shopping");
       });
       if (target) {
         target.scrollIntoView?.({ block: "center", inline: "center" });
@@ -215,62 +247,60 @@ async function clickContinueShoppingIfPresent(page) {
 }
 
 /**
- * Handle "Continue shopping" flows and ADOPT a new page if one opens
- * Returns the active page (may be a different Page instance)
+ * Handle "Continue/Keep shopping" and return a guaranteed alive page.
+ * If Amazon kills the tab and no replacement appears, open a **new page**
+ * and reload the provided fallback URL.
  */
-async function handleContinueShopping(page, context) {
-  const clicked = await clickContinueShoppingIfPresent(page);
-  if (!clicked) return page;
-
-  // Wait for either navigation or a popup/new page
-  const popupPromise = context
-    .waitForEvent("page", { timeout: 8000 })
-    .catch(() => null);
-  const navPromise = page
-    .waitForNavigation({ timeout: 15000, waitUntil: "commit" })
-    .catch(() => null);
-  const dclPromise = page
-    .waitForLoadState("domcontentloaded", { timeout: 15000 })
-    .catch(() => null);
-
-  await Promise.race([popupPromise, navPromise, dclPromise]);
-
-  // Prefer a newly opened, alive page that is not about:blank
-  const pages = context.pages();
-  const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
-  if (active && active !== page) {
-    await active.bringToFront().catch(() => {});
-    return active;
-  }
-
-  // If the current page died, fallback to any alive page
-  if (page.isClosed()) {
-    const fallback = pages.find((p) => !p.isClosed());
-    if (fallback) return fallback;
-    throw new Error("Page closed after continue-shopping handling");
-  }
-
-  // If the button still appears, reload once
+async function handleContinueShopping(page, context, fallbackUrl) {
   try {
-    const stillThere = await page.evaluate(() => {
-      const nodes = Array.from(
-        document.querySelectorAll('button, a, input[type="submit"], div[role="button"]')
-      );
-      return nodes.some((n) =>
-        ((n.innerText || n.value || "") + "")
-          .toLowerCase()
-          .includes("continue shopping")
-      );
-    });
-    if (stillThere) {
-      await page.reload({ timeout: 20000, waitUntil: "commit" }).catch(() => {});
-      await page
-        .waitForLoadState("domcontentloaded", { timeout: 10000 })
-        .catch(() => {});
-    }
-  } catch {}
+    const clicked = await clickContinueShoppingIfPresent(page);
+    if (!clicked) return page;
 
-  return page;
+    // Wait for either navigation or a popup/new page to appear
+    const popupPromise = context
+      .waitForEvent("page", { timeout: 8000 })
+      .catch(() => null);
+    const navPromise = page
+      .waitForNavigation({ timeout: 15000, waitUntil: "commit" })
+      .catch(() => null);
+    const dclPromise = page
+      .waitForLoadState("domcontentloaded", { timeout: 15000 })
+      .catch(() => null);
+
+    await Promise.race([popupPromise, navPromise, dclPromise]);
+
+    // Prefer a newly opened, alive page that is not about:blank
+    const pages = context.pages();
+    const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
+    if (active && active !== page) {
+      try { await active.bringToFront(); } catch {}
+      return active;
+    }
+
+    // If the current page is still alive, keep it
+    if (page && !page.isClosed()) return page;
+
+    // Fallback: create a fresh page and go back to the product URL
+    const fresh = await context.newPage();
+    try { await fresh.bringToFront(); } catch {}
+    if (fallbackUrl) {
+      await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
+    }
+    return fresh;
+  } catch {
+    // Last-resort: try to adopt any alive page, else new page to fallbackUrl
+    try {
+      const adopted = await adoptActivePageOrThrow(page, context);
+      return adopted;
+    } catch {
+      const fresh = await context.newPage();
+      try { await fresh.bringToFront(); } catch {}
+      if (fallbackUrl) {
+        await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
+      }
+      return fresh;
+    }
+  }
 }
 
 /**
@@ -710,9 +740,9 @@ app.get("/scrape", async (req, res) => {
     await safeGoto(page, url, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Dismiss/handle "Continue shopping" and ADOPT new page if Amazon opens one
-    page = await handleContinueShopping(page, context);
-    ensureAlive(page, "Page closed after continue-shopping handling");
+    // Dismiss/handle "Continue/Keep shopping"
+    page = await handleContinueShopping(page, context, url);
+    ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
 
     // Product page or not? (retry if page closed)
     let productLike;
@@ -813,15 +843,15 @@ app.get("/scrape", async (req, res) => {
       pageType: "product",
       ASIN: asin || "Unspecified",
       title: scraped.title || "Unspecified",
-      brand: gemini.brand || "Unspecified",               // Gemini OCR
-      itemForm: scraped.itemForm || "Unspecified",        // Playwright
-      price: scraped.price || "Unspecified",              // Playwright (with currency ensured)
-      priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
+      brand: gemini.brand || "Unspecified", // Gemini OCR
+      itemForm: scraped.itemForm || "Unspecified", // Playwright
+      price: scraped.price || "Unspecified", // Playwright (with currency ensured)
+      priceGemini: priceGemini || "Unspecified", // Gemini OCR normalized
       featuredBullets: scraped.featuredBullets || "Unspecified",
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
-      screenshot: base64,                                  // base64 PNG
+      screenshot: base64, // base64 PNG
     });
   } catch (err) {
     res.status(500).json({
