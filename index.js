@@ -5,11 +5,20 @@
 // GET /scrape?url=...
 
 import express from "express";
+import cors from "cors";
 import { chromium } from "playwright";
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+
+// Allow browser requests from Airtable (right panel scripting)
+app.use(
+  cors({
+    origin: [/^https:\/\/airtable\.com$/, /^https:\/\/.*\.airtableblocks\.com$/],
+    methods: ["GET"],
+  })
+);
 
 // Gemini client
 if (!process.env.GEMINI_API_KEY) {
@@ -678,7 +687,8 @@ app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
 
-  const width = 1280, height = 800;
+  const width = 1280,
+    height = 800;
 
   let browser, context, page;
   try {
@@ -747,15 +757,15 @@ app.get("/scrape", async (req, res) => {
       pageType: "product",
       ASIN: asin || "Unspecified",
       title: scraped.title || "Unspecified",
-      brand: gemini.brand || "Unspecified",               // Gemini OCR
-      itemForm: scraped.itemForm || "Unspecified",        // Playwright
-      price: scraped.price || "Unspecified",              // Playwright (with currency ensured)
-      priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
+      brand: gemini.brand || "Unspecified", // Gemini OCR
+      itemForm: scraped.itemForm || "Unspecified", // Playwright
+      price: scraped.price || "Unspecified", // Playwright (with currency ensured)
+      priceGemini: priceGemini || "Unspecified", // Gemini OCR normalized
       featuredBullets: scraped.featuredBullets || "Unspecified",
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
-      screenshot: base64,                                  // base64 PNG
+      screenshot: base64, // base64 PNG
     });
   } catch (err) {
     res.status(500).json({
