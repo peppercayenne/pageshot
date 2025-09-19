@@ -1,5 +1,5 @@
 // index.js
-// Express + Playwright + Gemini OCR + CamelCamelCamel
+// Express + Playwright + Gemini OCR + CamelCamelCamel (with fallback)
 // Amazon: DOM scrape + Gemini OCR (brand/price)  → /scrape
 // CamelCamelCamel: product_fields table scrape    → /camel
 //
@@ -721,13 +721,117 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   return s || "Unspecified";
 }
 
+/* ===========================
+   CamelCamelCamel helpers
+   =========================== */
+
+// Detect Camel's verification/challenge page
+async function isCamelVerificationGate(page) {
+  try {
+    const { inner, hasCf } = await page.evaluate(() => {
+      const inner = (document.body?.innerText || "").toLowerCase();
+      const hasCf =
+        !!document.querySelector("#challenge-running, #challenge-stage, .cf-challenge, [data-cf]") ||
+        /challenge-platform|turnstile|cloudflare/i.test(document.documentElement.outerHTML);
+      return { inner, hasCf };
+    });
+    return (
+      hasCf ||
+      inner.includes("verifying you are human") ||
+      inner.includes("checking your browser before accessing")
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Fallback: fetch similar fields from Amazon by ASIN
+async function scrapeAmazonFieldsByASIN(context, asin) {
+  const page = await context.newPage();
+  const url = `https://www.amazon.com/dp/${asin}`;
+  await safeGoto(page, url, { retries: 1, timeout: 60000 });
+  await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+
+  const vals = await page.evaluate(() => {
+    const clean = (s) =>
+      (s || "")
+        .replace(/\u00AD|\u200B|\u2060|\uFEFF/g, "") // soft hyphen/ZW spaces
+        .replace(/\u00A0/g, " ")                     // nbsp -> space
+        .replace(/\s+/g, " ")
+        .trim();
+
+    // Search common product detail tables + bullet lists
+    const findInTables = (labelRe) => {
+      const scopes = [
+        "#productDetails_techSpec_section_1",
+        "#productDetails_detailBullets_sections1",
+        "#prodDetails",
+        ".prodDetTable",
+        "#detailBullets_feature_div",
+      ];
+      for (const sel of scopes) {
+        const root = document.querySelector(sel);
+        if (!root) continue;
+
+        // table rows
+        const rows = Array.from(root.querySelectorAll("tr"));
+        for (const tr of rows) {
+          const cells = tr.querySelectorAll("th,td");
+          if (cells.length < 2) continue;
+          const label = clean(cells[0].innerText || cells[0].textContent || "");
+          const value = clean(cells[1].innerText || cells[1].textContent || "");
+          if (labelRe.test(label)) return value;
+        }
+        // bullet-style "Label: Value"
+        const bullets = Array.from(root.querySelectorAll("li"));
+        for (const li of bullets) {
+          const txt = clean(li.innerText || li.textContent || "");
+          const m = txt.match(/^([^:]+):\s*(.+)$/);
+          if (m && labelRe.test(m[1])) return clean(m[2]);
+        }
+      }
+      return "";
+    };
+
+    // Breadcrumbs for product group/category
+    const crumbs = Array.from(
+      document.querySelectorAll("#wayfinding-breadcrumbs_feature_div ul li a")
+    )
+      .map((a) => clean(a.innerText || a.textContent || ""))
+      .filter(Boolean);
+
+    const productGroup = crumbs[0] || "";
+    const category = crumbs.join(" > ") || "";
+
+    const manufacturer =
+      findInTables(/manufacturer/i) || clean(document.querySelector("#bylineInfo")?.innerText || "");
+
+    // “List Price” sometimes appears in tables or price box (strikethrough)
+    const listPrice =
+      findInTables(/list\s*price/i) || clean(document.querySelector("#price .a-text-price")?.innerText || "");
+
+    const upc = findInTables(/\bUPC\b/i);
+
+    return { productGroup, category, manufacturer, listPrice, upc };
+  });
+
+  let shot = "";
+  try {
+    const buf = await page.screenshot({ type: "png" });
+    shot = buf.toString("base64");
+  } catch {}
+  try { await page.close(); } catch {}
+
+  return { ...vals, screenshot: shot, url };
+}
+
 // ---------- endpoints ----------
 app.get("/", (req, res) => {
   res.send("✅ Scraper is up (Amazon + CamelCamelCamel).");
 });
 
 /**
- * AMAZON endpoint (existing)
+ * AMAZON endpoint
  * Supports mode=product (default) and mode=links
  */
 app.get("/scrape", async (req, res) => {
@@ -865,11 +969,8 @@ app.get("/scrape", async (req, res) => {
 });
 
 /**
- * NEW: CAMELCAMELCAMEL endpoint
+ * CAMELCAMELCAMEL endpoint (with verification detection + Amazon fallback)
  * /camel?url=<amazon-url-or-asin>
- * - Extract ASIN
- * - Go to https://camelcamelcamel.com/product/<ASIN>
- * - Parse table.product_fields: Product Group, Category, Manufacturer, List Price, UPC
  */
 app.get("/camel", async (req, res) => {
   const inputUrl = req.query.url || "";
@@ -891,26 +992,44 @@ app.get("/camel", async (req, res) => {
     await safeGoto(page, camelUrl, { retries: 2, timeout: 60000 });
     await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
 
-    // Scrape Camel table
+    // Give the challenge a brief chance to auto-complete
+    await page
+      .waitForFunction(
+        () => !/verifying you are human/i.test(document.body?.innerText || ""),
+        { timeout: 8000 }
+      )
+      .catch(() => null);
+
+    const challenged = await isCamelVerificationGate(page);
+
+    if (challenged) {
+      // Fallback to Amazon-derived values
+      const fb = await scrapeAmazonFieldsByASIN(context, asin);
+      return res.json({
+        ok: true,
+        source: "amazon-fallback",
+        url: fb.url,
+        ASIN: asin,
+        productGroup: fb.productGroup || "Unspecified",
+        category: fb.category || "Unspecified",
+        manufacturer: fb.manufacturer || "Unspecified",
+        priceCamel: fb.listPrice || "Unspecified",
+        upc: fb.upc || "Unspecified",
+        screenshot: fb.screenshot || "",
+        note: "Camel blocked by verification; returned Amazon-derived fields instead.",
+      });
+    }
+
+    // Not challenged → parse Camel table
     const details = await page.evaluate(() => {
-      const cleanText = (node) => {
-        const raw = (node?.innerText || node?.textContent || "")
-          .replace(/\u00AD/g, "")      // soft hyphen
-          .replace(/\u200B/g, "")      // zero-width space
-          .replace(/\u2060/g, "")      // word joiner
-          .replace(/\uFEFF/g, "")      // zero-width no-break space
-          .replace(/\u00A0/g, " ");    // nbsp → space
-        return raw.replace(/\s+/g, " ").trim();
-      };
+      const cleanText = (node) =>
+        (node?.innerText || node?.textContent || "")
+          .replace(/\u00AD|\u200B|\u2060|\uFEFF/g, "") // soft hyphen/ZW spaces
+          .replace(/\u00A0/g, " ")                    // nbsp -> space
+          .replace(/\s+/g, " ")
+          .trim();
 
-      const out = {
-        productGroup: "",
-        category: "",
-        manufacturer: "",
-        listPrice: "",
-        upc: "",
-      };
-
+      const out = { productGroup: "", category: "", manufacturer: "", listPrice: "", upc: "" };
       const table = document.querySelector("table.product_fields");
       if (!table) return out;
 
@@ -923,18 +1042,15 @@ app.get("/camel", async (req, res) => {
         const value = cleanText(tds[1]);
 
         if (!label) continue;
-
         if (/product\s*group/.test(label)) out.productGroup = value;
         else if (/category/.test(label)) out.category = value;
         else if (/manufacturer/.test(label)) out.manufacturer = value;
         else if (/list\s*price/.test(label)) out.listPrice = value;
         else if (/\bupc\b/.test(label)) out.upc = value;
       }
-
       return out;
     });
 
-    // Screenshot (optional but useful for Airtable preview/debug)
     const buf = await safeScreenshot(page, { type: "png" }, 1);
     const base64 = buf.toString("base64");
 
@@ -946,7 +1062,7 @@ app.get("/camel", async (req, res) => {
       productGroup: details.productGroup || "Unspecified",
       category: details.category || "Unspecified",
       manufacturer: details.manufacturer || "Unspecified",
-      priceCamel: details.listPrice || "Unspecified", // Airtable maps this to "Price (Camel)"
+      priceCamel: details.listPrice || "Unspecified",
       upc: details.upc || "Unspecified",
       screenshot: base64,
     });
