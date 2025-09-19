@@ -1,8 +1,10 @@
 // index.js
-// Express + Playwright + Gemini OCR
-// Scrapes Amazon product info via DOM + Gemini OCR on screenshot
+// Express + Playwright + Gemini OCR + CamelCamelCamel
+// Amazon: DOM scrape + Gemini OCR (brand/price)  → /scrape
+// CamelCamelCamel: product_fields table scrape    → /camel
 //
-// GET /scrape?url=...
+// GET /scrape?url=...&mode=product|links
+// GET /camel?url=...
 
 import express from "express";
 import cors from "cors";
@@ -137,7 +139,7 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
       await sleep(jitter(700, 600));
 
       if (await looksBlocked(page)) {
-        throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
+        throw new Error("Blocked by CAPTCHA/anti-bot");
       }
       return;
     } catch (err) {
@@ -151,7 +153,7 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
 }
 
 /**
- * Close the "Added to Cart" side sheet if visible
+ * Close the "Added to Cart" side sheet if visible (Amazon)
  */
 async function closeAttachSideSheetIfVisible(page) {
   try {
@@ -180,7 +182,7 @@ async function closeAttachSideSheetIfVisible(page) {
 }
 
 /**
- * Detect & click "Continue/Keep shopping" if present
+ * Detect & click "Continue/Keep shopping" if present (Amazon)
  */
 async function clickContinueShoppingIfPresent(page) {
   if (await closeAttachSideSheetIfVisible(page)) {
@@ -244,9 +246,7 @@ async function clickContinueShoppingIfPresent(page) {
 }
 
 /**
- * Handle "Continue/Keep shopping" and return a guaranteed alive page.
- * If Amazon kills the tab and no replacement appears, open a **new page**
- * and reload the provided fallback URL.
+ * Handle "Continue/Keep shopping" and return alive page (Amazon)
  */
 async function handleContinueShopping(page, context, fallbackUrl) {
   try {
@@ -426,7 +426,7 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
 }
 
 /**
- * Scrape product data from DOM (Playwright-only fields)
+ * Scrape product data from DOM (Playwright-only fields) — AMAZON
  * NOTE: Brand is NOT scraped here (Gemini OCR handles brand).
  */
 async function scrapeProductData(page) {
@@ -647,11 +647,7 @@ Rules:
   }
 }
 
-// ---------- endpoints ----------
-app.get("/", (req, res) => {
-  res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
-});
-
+// ---------- Common utilities ----------
 function extractASINFromUrl(u = "") {
   try {
     const url = new URL(u);
@@ -664,6 +660,13 @@ function extractASINFromUrl(u = "") {
     const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
     return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
   }
+}
+function coerceASIN(input = "") {
+  const s = String(input || "").trim();
+  const fromUrl = extractASINFromUrl(s);
+  if (fromUrl) return fromUrl;
+  const m = s.match(/^[A-Z0-9]{8,10}$/i);
+  return m ? m[0].toUpperCase() : "";
 }
 
 function includesCurrency(s = "") {
@@ -718,8 +721,20 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   return s || "Unspecified";
 }
 
+// ---------- endpoints ----------
+app.get("/", (req, res) => {
+  res.send("✅ Scraper is up (Amazon + CamelCamelCamel).");
+});
+
+/**
+ * AMAZON endpoint (existing)
+ * Supports mode=product (default) and mode=links
+ */
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
+  const mode = String(req.query.mode || "product").toLowerCase(); // "product" | "links"
+  const force = req.query.force === "1" || req.query.force === "true";
+
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
 
   const width = 1280, height = 800;
@@ -731,15 +746,12 @@ app.get("/scrape", async (req, res) => {
     context = ctx.context;
     page = ctx.page;
 
-    // Hardened navigation with retry + CAPTCHA detection
+    // Navigate & handle side-sheets/continue shopping
     await safeGoto(page, url, { retries: 2, timeout: 60000 });
-    ensureAlive(page, "Page unexpectedly closed after navigation");
-
-    // Dismiss/handle "Continue/Keep shopping"
     page = await handleContinueShopping(page, context, url);
     ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
 
-    // Product page or not? (retry if page closed)
+    // Decide page type once (used by both modes)
     let productLike;
     try {
       productLike = await isProductPage(page);
@@ -753,45 +765,44 @@ app.get("/scrape", async (req, res) => {
       }
     }
 
-    // If NOT a product page: capture screenshot, extract links/buttons, return.
-    if (!productLike) {
-      let bufNP;
-      try {
-        bufNP = await safeScreenshot(page, { type: "png" }, 1);
-      } catch (e) {
-        if (isClosedErr(e)) {
-          page = await adoptActivePageOrThrow(page, context);
-          bufNP = await safeScreenshot(page, { type: "png" }, 1);
-        } else {
-          throw e;
-        }
+    // ---------- MODE: LINKS ----------
+    if (mode === "links") {
+      if (productLike && !force) {
+        const buf = await safeScreenshot(page, { type: "png" }, 1);
+        return res.json({
+          ok: true,
+          url: page.url(),
+          pageType: "product",
+          note: 'On product page; skipping links/buttons (pass ?force=1 to override).',
+          screenshot: buf.toString("base64"),
+          counts: { links: 0, buttons: 0 },
+          links: [],
+          buttons: [],
+        });
       }
-      const base64NP = bufNP.toString("base64");
-      const meta = {
-        currentUrl: page.url(),
-        title: (await page.title().catch(() => "")) || "",
-      };
+
       const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({
         links: [],
         buttons: [],
         counts: { links: 0, buttons: 0 },
       }));
+      const buf = await safeScreenshot(page, { type: "png" }, 1);
+
       return res.json({
         ok: true,
-        url: meta.currentUrl,
-        pageType: "nonProduct",
-        screenshot: base64NP,
-        meta,
+        url: page.url(),
+        pageType: productLike ? "product" : "nonProduct",
+        counts,
         links,
         buttons,
-        counts,
+        screenshot: buf.toString("base64"),
       });
     }
 
-    // Small pause to stabilize above-the-fold
+    // ---------- MODE: PRODUCT (default) ----------
     await sleep(jitter(300, 400));
 
-    // Scrape Playwright data (retry if page closed mid-evaluate)
+    // Scrape Playwright fields (retry once if page was swapped)
     let scraped;
     try {
       scraped = await scrapeProductData(page);
@@ -807,7 +818,7 @@ app.get("/scrape", async (req, res) => {
 
     ensureAlive(page, "Page closed before screenshot");
 
-    // Screenshot for OCR (with retry + adopt)
+    // Screenshot for OCR
     let buf;
     try {
       buf = await safeScreenshot(page, { type: "png" }, 1);
@@ -821,50 +832,129 @@ app.get("/scrape", async (req, res) => {
     }
     const base64 = buf.toString("base64");
 
-    // Gemini OCR for Brand + Price (with currency)
+    // Gemini OCR (brand + price) and price normalization
     const gemini = await geminiExtract(base64);
+    const priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
 
-    // Normalize Gemini price
-    let priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
-
-    // ASIN from final resolved URL
+    // ASIN & final response
     const resolvedUrl = page.url() || url;
     const asin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(url);
 
-    // Final JSON
-    res.json({
+    return res.json({
       ok: true,
       url: resolvedUrl,
-      pageType: "product",
+      pageType: productLike ? "product" : "nonProduct",
       ASIN: asin || "Unspecified",
       title: scraped.title || "Unspecified",
-      brand: gemini.brand || "Unspecified",               // Gemini OCR
-      itemForm: scraped.itemForm || "Unspecified",        // Playwright (new logic)
-      price: scraped.price || "Unspecified",              // Playwright (currency ensured)
-      priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
+      brand: gemini.brand || "Unspecified",
+      itemForm: scraped.itemForm || "Unspecified",
+      price: scraped.price || "Unspecified",
+      priceGemini: priceGemini || "Unspecified",
       featuredBullets: scraped.featuredBullets || "Unspecified",
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
-      screenshot: base64,                                  // base64 PNG
+      screenshot: base64,
     });
   } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err?.message || String(err),
-    });
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
   } finally {
-    // Close all pages in context to avoid leaks if a popup was opened
-    try {
-      for (const p of context?.pages?.() || []) {
-        try {
-          if (!p.isClosed()) await p.close({ runBeforeUnload: false });
-        } catch {}
+    try { for (const p of context?.pages?.() || []) if (!p.isClosed()) await p.close({ runBeforeUnload: false }); } catch {}
+    try { await browser?.close(); } catch {}
+  }
+});
+
+/**
+ * NEW: CAMELCAMELCAMEL endpoint
+ * /camel?url=<amazon-url-or-asin>
+ * - Extract ASIN
+ * - Go to https://camelcamelcamel.com/product/<ASIN>
+ * - Parse table.product_fields: Product Group, Category, Manufacturer, List Price, UPC
+ */
+app.get("/camel", async (req, res) => {
+  const inputUrl = req.query.url || "";
+  const asin = coerceASIN(inputUrl);
+  if (!asin) {
+    return res.status(400).json({ ok: false, error: "Could not determine ASIN from url" });
+  }
+
+  const camelUrl = `https://camelcamelcamel.com/product/${asin}`;
+  const width = 1280, height = 800;
+
+  let browser, context, page;
+  try {
+    const ctx = await minimalContext(width, height);
+    browser = ctx.browser;
+    context = ctx.context;
+    page = ctx.page;
+
+    await safeGoto(page, camelUrl, { retries: 2, timeout: 60000 });
+    await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+
+    // Scrape Camel table
+    const details = await page.evaluate(() => {
+      const cleanText = (node) => {
+        const raw = (node?.innerText || node?.textContent || "")
+          .replace(/\u00AD/g, "")      // soft hyphen
+          .replace(/\u200B/g, "")      // zero-width space
+          .replace(/\u2060/g, "")      // word joiner
+          .replace(/\uFEFF/g, "")      // zero-width no-break space
+          .replace(/\u00A0/g, " ");    // nbsp → space
+        return raw.replace(/\s+/g, " ").trim();
+      };
+
+      const out = {
+        productGroup: "",
+        category: "",
+        manufacturer: "",
+        listPrice: "",
+        upc: "",
+      };
+
+      const table = document.querySelector("table.product_fields");
+      if (!table) return out;
+
+      const rows = Array.from(table.querySelectorAll("tr"));
+      for (const tr of rows) {
+        const tds = tr.querySelectorAll("td");
+        if (tds.length < 2) continue;
+
+        const label = cleanText(tds[0]).toLowerCase();
+        const value = cleanText(tds[1]);
+
+        if (!label) continue;
+
+        if (/product\s*group/.test(label)) out.productGroup = value;
+        else if (/category/.test(label)) out.category = value;
+        else if (/manufacturer/.test(label)) out.manufacturer = value;
+        else if (/list\s*price/.test(label)) out.listPrice = value;
+        else if (/\bupc\b/.test(label)) out.upc = value;
       }
-    } catch {}
-    try {
-      await browser?.close();
-    } catch {}
+
+      return out;
+    });
+
+    // Screenshot (optional but useful for Airtable preview/debug)
+    const buf = await safeScreenshot(page, { type: "png" }, 1);
+    const base64 = buf.toString("base64");
+
+    return res.json({
+      ok: true,
+      source: "camel",
+      url: camelUrl,
+      ASIN: asin,
+      productGroup: details.productGroup || "Unspecified",
+      category: details.category || "Unspecified",
+      manufacturer: details.manufacturer || "Unspecified",
+      priceCamel: details.listPrice || "Unspecified", // Airtable maps this to "Price (Camel)"
+      upc: details.upc || "Unspecified",
+      screenshot: base64,
+    });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+  } finally {
+    try { for (const p of context?.pages?.() || []) if (!p.isClosed()) await p.close({ runBeforeUnload: false }); } catch {}
+    try { await browser?.close(); } catch {}
   }
 });
 
