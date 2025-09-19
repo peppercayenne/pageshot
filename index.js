@@ -1,5 +1,5 @@
 // index.js
-// Express + Playwright + Gemini OCR + CamelCamelCamel (with fallback)
+// Express + Playwright + Gemini OCR + CamelCamelCamel (with fallback & page-rescue)
 // Amazon: DOM scrape + Gemini OCR (brand/price)  → /scrape
 // CamelCamelCamel: product_fields table scrape    → /camel
 //
@@ -692,7 +692,7 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
     "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
     "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
     "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
-    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+    "₅": "5", "₆": "6", "⁷": "7", "₈": "8", "₉": "9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
 
@@ -823,6 +823,33 @@ async function scrapeAmazonFieldsByASIN(context, asin) {
   try { await page.close(); } catch {}
 
   return { ...vals, screenshot: shot, url };
+}
+
+/**
+ * Run a task and auto-rescue if the page/context was closed.
+ * If closed, adopt another alive page or open a fresh one and reload the URL, then retry once.
+ */
+async function withPageAlive(page, context, reloadUrl, workFn) {
+  try {
+    ensureAlive(page);
+    return await workFn(page);
+  } catch (err) {
+    if (!isClosedErr(err)) throw err;
+
+    // Try to adopt an existing alive page
+    let p;
+    try {
+      p = await adoptActivePageOrThrow(page, context);
+    } catch {
+      // Open a fresh page and navigate back
+      p = await context.newPage();
+      await safeGoto(p, reloadUrl, { retries: 1, timeout: 60000 });
+      await p.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+    }
+
+    ensureAlive(p);
+    return await workFn(p);
+  }
 }
 
 // ---------- endpoints ----------
@@ -969,7 +996,7 @@ app.get("/scrape", async (req, res) => {
 });
 
 /**
- * CAMELCAMELCAMEL endpoint (with verification detection + Amazon fallback)
+ * CAMELCAMELCAMEL endpoint (with verification detection + Amazon fallback + page-rescue)
  * /camel?url=<amazon-url-or-asin>
  */
 app.get("/camel", async (req, res) => {
@@ -993,14 +1020,16 @@ app.get("/camel", async (req, res) => {
     await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
 
     // Give the challenge a brief chance to auto-complete
-    await page
-      .waitForFunction(
-        () => !/verifying you are human/i.test(document.body?.innerText || ""),
-        { timeout: 8000 }
-      )
-      .catch(() => null);
+    await withPageAlive(page, context, camelUrl, (p) =>
+      p
+        .waitForFunction(
+          () => !/verifying you are human/i.test(document.body?.innerText || ""),
+          { timeout: 8000 }
+        )
+        .catch(() => null)
+    );
 
-    const challenged = await isCamelVerificationGate(page);
+    const challenged = await withPageAlive(page, context, camelUrl, (p) => isCamelVerificationGate(p));
 
     if (challenged) {
       // Fallback to Amazon-derived values
@@ -1020,38 +1049,40 @@ app.get("/camel", async (req, res) => {
       });
     }
 
-    // Not challenged → parse Camel table
-    const details = await page.evaluate(() => {
-      const cleanText = (node) =>
-        (node?.innerText || node?.textContent || "")
-          .replace(/\u00AD|\u200B|\u2060|\uFEFF/g, "") // soft hyphen/ZW spaces
-          .replace(/\u00A0/g, " ")                    // nbsp -> space
-          .replace(/\s+/g, " ")
-          .trim();
+    // Not challenged → parse Camel table (auto-rescue if page closes)
+    const details = await withPageAlive(page, context, camelUrl, (p) =>
+      p.evaluate(() => {
+        const cleanText = (node) =>
+          (node?.innerText || node?.textContent || "")
+            .replace(/\u00AD|\u200B|\u2060|\uFEFF/g, "") // soft hyphen/ZW spaces
+            .replace(/\u00A0/g, " ")                    // nbsp -> space
+            .replace(/\s+/g, " ")
+            .trim();
 
-      const out = { productGroup: "", category: "", manufacturer: "", listPrice: "", upc: "" };
-      const table = document.querySelector("table.product_fields");
-      if (!table) return out;
+        const out = { productGroup: "", category: "", manufacturer: "", listPrice: "", upc: "" };
+        const table = document.querySelector("table.product_fields");
+        if (!table) return out;
 
-      const rows = Array.from(table.querySelectorAll("tr"));
-      for (const tr of rows) {
-        const tds = tr.querySelectorAll("td");
-        if (tds.length < 2) continue;
+        const rows = Array.from(table.querySelectorAll("tr"));
+        for (const tr of rows) {
+          const tds = tr.querySelectorAll("td");
+          if (tds.length < 2) continue;
 
-        const label = cleanText(tds[0]).toLowerCase();
-        const value = cleanText(tds[1]);
+          const label = cleanText(tds[0]).toLowerCase();
+          const value = cleanText(tds[1]);
 
-        if (!label) continue;
-        if (/product\s*group/.test(label)) out.productGroup = value;
-        else if (/category/.test(label)) out.category = value;
-        else if (/manufacturer/.test(label)) out.manufacturer = value;
-        else if (/list\s*price/.test(label)) out.listPrice = value;
-        else if (/\bupc\b/.test(label)) out.upc = value;
-      }
-      return out;
-    });
+          if (!label) continue;
+          if (/product\s*group/.test(label)) out.productGroup = value;
+          else if (/category/.test(label)) out.category = value;
+          else if (/manufacturer/.test(label)) out.manufacturer = value;
+          else if (/list\s*price/.test(label)) out.listPrice = value;
+          else if (/\bupc\b/.test(label)) out.upc = value;
+        }
+        return out;
+      })
+    );
 
-    const buf = await safeScreenshot(page, { type: "png" }, 1);
+    const buf = await withPageAlive(page, context, camelUrl, (p) => safeScreenshot(p, { type: "png" }, 1));
     const base64 = buf.toString("base64");
 
     return res.json({
@@ -1067,7 +1098,25 @@ app.get("/camel", async (req, res) => {
       screenshot: base64,
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+    // Last-resort: try Amazon fallback instead of 500
+    try {
+      const fb = await scrapeAmazonFieldsByASIN(context, coerceASIN(req.query.url || ""));
+      return res.json({
+        ok: true,
+        source: "amazon-fallback",
+        url: fb.url || "",
+        ASIN: coerceASIN(req.query.url || "") || "Unspecified",
+        productGroup: fb.productGroup || "Unspecified",
+        category: fb.category || "Unspecified",
+        manufacturer: fb.manufacturer || "Unspecified",
+        priceCamel: fb.listPrice || "Unspecified",
+        upc: fb.upc || "Unspecified",
+        screenshot: fb.screenshot || "",
+        note: "Recovered from error; returned Amazon-derived fields instead.",
+      });
+    } catch {
+      return res.status(500).json({ ok: false, error: err?.message || String(err) });
+    }
   } finally {
     try { for (const p of context?.pages?.() || []) if (!p.isClosed()) await p.close({ runBeforeUnload: false }); } catch {}
     try { await browser?.close(); } catch {}
