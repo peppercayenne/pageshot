@@ -1,5 +1,5 @@
 // index.js
-// Express + Playwright + Gemini OCR + CamelCamelCamel (with fallback & page-rescue)
+// Express + Playwright + Gemini OCR + CamelCamelCamel (with robust fallback)
 // Amazon: DOM scrape + Gemini OCR (brand/price)  → /scrape
 // CamelCamelCamel: product_fields table scrape    → /camel
 //
@@ -63,25 +63,20 @@ async function minimalContext(width, height) {
     "accept-language": "en-US,en;q=0.9",
   });
 
-  // Return context so we can adopt new pages/popups later
   return { browser, context, page };
 }
 
-/**
- * Simple helpers
- */
+/** Helpers */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
 
 function ensureAlive(page, msg = "Page is closed") {
   if (!page || page.isClosed()) throw new Error(msg);
 }
-
 function isClosedErr(err) {
   const msg = (err && err.message) || String(err || "");
   return /Target page, context or browser has been closed/i.test(msg);
 }
-
 async function adoptActivePageOrThrow(currentPage, context) {
   if (currentPage && !currentPage.isClosed()) return currentPage;
   const pages = context.pages().filter((p) => !p.isClosed());
@@ -95,52 +90,31 @@ async function adoptActivePageOrThrow(currentPage, context) {
   if (pages[0]) return pages[0];
   throw new Error("All pages are closed");
 }
-
 function isRobotCheckUrl(url) {
   if (!url) return false;
-  return (
-    url.includes("/errors/validateCaptcha") ||
-    url.includes("/captcha") ||
-    url.includes("/sorry")
-  );
+  return url.includes("/errors/validateCaptcha") || url.includes("/captcha") || url.includes("/sorry");
 }
-
 async function looksBlocked(page) {
   try {
     const url = page.url();
     if (isRobotCheckUrl(url)) return true;
-
     const title = (await page.title().catch(() => "")) || "";
     if (/robot check/i.test(title) || /captcha/i.test(title)) return true;
-
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
-    if (
-      /enter the characters/i.test(bodyText) ||
-      /type the characters/i.test(bodyText) ||
-      /sorry/i.test(bodyText)
-    ) {
-      return true;
-    }
+    if (/enter the characters|type the characters|sorry/i.test(bodyText)) return true;
   } catch {}
   return false;
 }
 
-/**
- * Navigation with retry + CAPTCHA detection
- */
+/** Navigation with retry + CAPTCHA detection */
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
-  let attempt = 0;
-  let lastErr;
-
+  let attempt = 0, lastErr;
   while (attempt <= retries) {
     try {
       await sleep(jitter(250, 500));
       await page.goto(url, { timeout, waitUntil: "commit" });
       await sleep(jitter(700, 600));
-
-      if (await looksBlocked(page)) {
-        throw new Error("Blocked by CAPTCHA/anti-bot");
-      }
+      if (await looksBlocked(page)) throw new Error("Blocked by CAPTCHA/anti-bot");
       return;
     } catch (err) {
       lastErr = err;
@@ -152,9 +126,7 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   throw lastErr || new Error("Navigation failed");
 }
 
-/**
- * Close the "Added to Cart" side sheet if visible (Amazon)
- */
+/** Amazon UI nuisances */
 async function closeAttachSideSheetIfVisible(page) {
   try {
     const closed = await page.evaluate(() => {
@@ -176,20 +148,12 @@ async function closeAttachSideSheetIfVisible(page) {
       return false;
     });
     return !!closed;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
-
-/**
- * Detect & click "Continue/Keep shopping" if present (Amazon)
- */
 async function clickContinueShoppingIfPresent(page) {
-  if (await closeAttachSideSheetIfVisible(page)) {
-    return true;
-  }
+  if (await closeAttachSideSheetIfVisible(page)) return true;
 
-  const KNOWN_SELECTORS = [
+  const KNOWN = [
     '#hlb-continue-shopping-announce',
     'a#hlb-continue-shopping-announce',
     '#continue-shopping',
@@ -202,8 +166,7 @@ async function clickContinueShoppingIfPresent(page) {
     'button:has-text("Keep shopping")',
     '#attach-close_sideSheet-link',
   ];
-
-  for (const sel of KNOWN_SELECTORS) {
+  for (const sel of KNOWN) {
     try {
       const el = page.locator(sel).first();
       if (await el.isVisible({ timeout: 500 }).catch(() => false)) {
@@ -212,7 +175,6 @@ async function clickContinueShoppingIfPresent(page) {
       }
     } catch {}
   }
-
   try {
     const textLoc = page.locator(
       'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping"), button:has-text("Keep shopping"), a:has-text("Keep shopping")'
@@ -222,7 +184,6 @@ async function clickContinueShoppingIfPresent(page) {
       return true;
     }
   } catch {}
-
   try {
     const clicked = await page.evaluate(() => {
       const nodes = Array.from(
@@ -232,22 +193,13 @@ async function clickContinueShoppingIfPresent(page) {
         const txt = ((n.innerText || n.value || "") + "").toLowerCase();
         return txt.includes("continue shopping") || txt.includes("keep shopping");
       });
-      if (target) {
-        target.scrollIntoView?.({ block: "center", inline: "center" });
-        target.click();
-        return true;
-      }
+      if (target) { target.scrollIntoView?.({ block: "center", inline: "center" }); target.click(); return true; }
       return false;
     });
     if (clicked) return true;
   } catch {}
-
   return false;
 }
-
-/**
- * Handle "Continue/Keep shopping" and return alive page (Amazon)
- */
 async function handleContinueShopping(page, context, fallbackUrl) {
   try {
     const clicked = await clickContinueShoppingIfPresent(page);
@@ -256,67 +208,46 @@ async function handleContinueShopping(page, context, fallbackUrl) {
     const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
     const navPromise = page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }).catch(() => null);
     const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => null);
-
     await Promise.race([popupPromise, navPromise, dclPromise]);
 
     const pages = context.pages();
     const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
-    if (active && active !== page) {
-      try { await active.bringToFront(); } catch {}
-      return active;
-    }
-
+    if (active && active !== page) { try { await active.bringToFront(); } catch {} return active; }
     if (page && !page.isClosed()) return page;
 
     const fresh = await context.newPage();
     try { await fresh.bringToFront(); } catch {}
-    if (fallbackUrl) {
-      await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
-    }
+    if (fallbackUrl) await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
     return fresh;
   } catch {
-    try {
-      const adopted = await adoptActivePageOrThrow(page, context);
-      return adopted;
-    } catch {
+    try { return await adoptActivePageOrThrow(page, context); }
+    catch {
       const fresh = await context.newPage();
       try { await fresh.bringToFront(); } catch {}
-      if (fallbackUrl) {
-        await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
-      }
+      if (fallbackUrl) await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
       return fresh;
     }
   }
 }
 
-/**
- * Safer screenshot with a small retry
- */
+/** Safer screenshot */
 async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
     ensureAlive(page, "Page closed before screenshot");
-    try {
-      return await page.screenshot(opts);
-    } catch (err) {
+    try { return await page.screenshot(opts); }
+    catch (err) {
       lastErr = err;
       const msg = (err && err.message) || String(err);
-      if (/Target page, context or browser has been closed/i.test(msg)) {
-        throw new Error("Screenshot failed: " + msg);
-      }
-      if (i < retries) {
-        await sleep(jitter(250, 500));
-        continue;
-      }
+      if (/Target page, context or browser has been closed/i.test(msg)) throw new Error("Screenshot failed: " + msg);
+      if (i < retries) { await sleep(jitter(250, 500)); continue; }
       throw new Error("Screenshot failed: " + msg);
     }
   }
   throw lastErr || new Error("Screenshot failed");
 }
 
-/**
- * Heuristic: are we on a proper Amazon product page?
- */
+/** Page type heuristic (Amazon) */
 async function isProductPage(page) {
   try {
     return await page.evaluate(() => {
@@ -333,34 +264,21 @@ async function isProductPage(page) {
       const hasBuyCtas =
         !!document.querySelector("#add-to-cart-button, input#add-to-cart-button") ||
         !!document.querySelector("#buy-now-button, input#buy-now-button");
-
       const layoutHints = !!document.querySelector("#dp, #dp-container, #ppd, #centerCol, #leftCol");
 
       return (urlFlag && hasTitle && layoutHints) || ((hasTitle || hasByline) && hasBuyCtas);
     });
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
-/**
- * Extract all <a> and button-like elements (used on non-product pages)
- */
+/** Links + buttons (Amazon non-product pages) */
 async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
   return await page.evaluate((limits) => {
-    const toAbs = (u) => {
-      try {
-        return u ? new URL(u, location.href).href : "";
-      } catch {
-        return u || "";
-      }
-    };
+    const toAbs = (u) => { try { return u ? new URL(u, location.href).href : ""; } catch { return u || ""; } };
     const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
 
     const linkNodes = Array.from(document.querySelectorAll("a"));
-    const btnNodes = Array.from(
-      document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]')
-    );
+    const btnNodes = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'));
 
     const links = linkNodes.slice(0, limits.maxLinks).map((el) => ({
       tag: "a",
@@ -387,70 +305,37 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
         role: el.getAttribute("role") || "",
         ariaLabel: el.getAttribute("aria-label") || "",
         onclick: el.getAttribute("onclick") || "",
-        href:
-          tag === "a"
-            ? toAbs(el.getAttribute("href"))
-            : el.getAttribute("href")
-            ? toAbs(el.getAttribute("href"))
-            : "",
+        href: tag === "a" ? toAbs(el.getAttribute("href")) : (el.getAttribute("href") ? toAbs(el.getAttribute("href")) : ""),
       };
     });
 
-    // Simple de-dupe
-    const seenL = new Set();
-    const dedupLinks = [];
-    for (const l of links) {
-      const k = `${l.href}|${l.text}`;
-      if (l.href && !seenL.has(k)) {
-        seenL.add(k);
-        dedupLinks.push(l);
-      }
-    }
+    // de-dupe
+    const seenL = new Set(), dedupLinks = [];
+    for (const l of links) { const k = `${l.href}|${l.text}`; if (l.href && !seenL.has(k)) { seenL.add(k); dedupLinks.push(l); } }
+    const seenB = new Set(), dedupButtons = [];
+    for (const b of buttons) { const k = `${b.text}|${b.id}`; if (!seenB.has(k)) { seenB.add(k); dedupButtons.push(b); } }
 
-    const seenB = new Set();
-    const dedupButtons = [];
-    for (const b of buttons) {
-      const k = `${b.text}|${b.id}`;
-      if (!seenB.has(k)) {
-        seenB.add(k);
-        dedupButtons.push(b);
-      }
-    }
-
-    return {
-      links: dedupLinks,
-      buttons: dedupButtons,
-      counts: { links: links.length, buttons: buttons.length },
-    };
+    return { links: dedupLinks, buttons: dedupButtons, counts: { links: links.length, buttons: buttons.length } };
   }, limits);
 }
 
-/**
- * Scrape product data from DOM (Playwright-only fields) — AMAZON
- * NOTE: Brand is NOT scraped here (Gemini OCR handles brand).
- */
+/** Amazon DOM scrape (Playwright fields only) */
 async function scrapeProductData(page) {
   const title =
     (await page.textContent("#productTitle").catch(() => null)) ||
     (await page.textContent("#title").catch(() => null));
 
   return await page.evaluate((title) => {
-    // -------- Item Form (prefer Product Overview row .po-item_form) --------
+    // Item Form (prefer Product Overview row .po-item_form)
     const itemForm = (() => {
-      // 1) Primary: <tr class="... po-item_form ..."> → value in 2nd <td>
-      const row =
-        document.querySelector("tr.po-item_form") ||
-        document.querySelector('tr[class*="po-item_form"]');
+      const row = document.querySelector("tr.po-item_form") || document.querySelector('tr[class*="po-item_form"]');
       if (row) {
         const tds = row.querySelectorAll("td");
         if (tds.length >= 2) {
-          const text = (tds[1].innerText || tds[1].textContent || "")
-            .replace(/\s+/g, " ")
-            .trim();
+          const text = (tds[1].innerText || tds[1].textContent || "").replace(/\s+/g, " ").trim();
           if (text) return text;
         }
       }
-      // 2) Any row where first <td> label contains "Item Form"
       const altRow = Array.from(document.querySelectorAll("tr")).find((tr) => {
         const firstTd = tr.querySelector("td");
         if (!firstTd) return false;
@@ -460,27 +345,21 @@ async function scrapeProductData(page) {
       if (altRow) {
         const tds = altRow.querySelectorAll("td");
         if (tds.length >= 2) {
-          const text = (tds[1].innerText || tds[1].textContent || "")
-            .replace(/\s+/g, " ")
-            .trim();
+          const text = (tds[1].innerText || tds[1].textContent || "").replace(/\s+/g, " ").trim();
           if (text) return text;
         }
       }
-      // 3) Fallback: bullet or list: "Item Form: Lotion"
-      const li = Array.from(
-        document.querySelectorAll("#detailBullets_feature_div li, li")
-      ).find((el) => /item\s*form/i.test(el.innerText || el.textContent || ""));
+      const li = Array.from(document.querySelectorAll("#detailBullets_feature_div li, li"))
+        .find((el) => /item\s*form/i.test(el.innerText || el.textContent || ""));
       if (li) {
-        const raw = (li.innerText || li.textContent || "")
-          .replace(/\s+/g, " ")
-          .trim();
+        const raw = (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim();
         const m = raw.match(/item\s*form\s*[:\-]?\s*(.+)$/i);
         if (m && m[1]) return m[1].trim();
       }
       return "";
     })();
 
-    // -------- Price (ensure currency) --------
+    // Price (ensure currency)
     const getPriceWithCurrency = () => {
       const priceEl =
         document.querySelector(".a-price .a-offscreen") ||
@@ -490,13 +369,9 @@ async function scrapeProductData(page) {
       const hasCurrency = /[\p{Sc}]|\b[A-Z]{3}\b/u.test(text);
       if (text && !hasCurrency) {
         const sym = document.querySelector(".a-price .a-price-symbol")?.textContent?.trim() || "";
-        if (sym) {
-          text = sym + text;
-        } else {
-          const iso =
-            document
-              .querySelector('meta[property="og:price:currency"]')
-              ?.getAttribute("content") || "";
+        if (sym) text = sym + text;
+        else {
+          const iso = document.querySelector('meta[property="og:price:currency"]')?.getAttribute("content") || "";
           if (iso) text = iso + " " + text;
         }
       }
@@ -504,7 +379,7 @@ async function scrapeProductData(page) {
     };
     const price = getPriceWithCurrency();
 
-    // -------- Featured bullets (each item prefixed with "• " and suffixed with " ") --------
+    // Featured bullets → "• text " per item
     const featuredBullets = (() => {
       const items = Array.from(document.querySelectorAll("#feature-bullets ul li"))
         .map((li) => (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim())
@@ -513,40 +388,32 @@ async function scrapeProductData(page) {
       return items.length ? items.join("") : "";
     })();
 
-    // -------- Product Description --------
+    // Product Description
     const productDescription = (() => {
       const el = document.querySelector("#productDescription");
       if (!el) return "";
       return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
     })();
 
-    // -------- Images --------
+    // Images
     const mainImageUrl = (() => {
       const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
       if (imgTag) return imgTag.getAttribute("src") || "";
       return "";
     })();
-
-    // Normalize thumbnail -> base jpg (do not force AC_SL here)
-    const normalizeImageUrl = (url) => {
-      if (!url) return "";
-      return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
-    };
+    const normalizeImageUrl = (url) => url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "";
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
-    // Collect candidate URLs from visible thumbs
     let additionalImageUrls = Array.from(document.querySelectorAll("#altImages img, .imageThumb img"))
       .map((img) => img.getAttribute("src") || "")
       .map((src) => (src || "").trim())
       .filter(Boolean);
 
-    // Also inspect landing image attributes
     const landing = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
     const fromLandingAttrs = [];
     if (landing) {
       const oldHires = landing.getAttribute("data-old-hires");
       if (oldHires) fromLandingAttrs.push(oldHires);
-
       const dyn = landing.getAttribute("data-a-dynamic-image");
       if (dyn) {
         try {
@@ -566,35 +433,20 @@ async function scrapeProductData(page) {
       }
     }
 
-    additionalImageUrls = [
-      ...additionalImageUrls,
-      ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
-    ];
+    additionalImageUrls = [...additionalImageUrls, ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean)];
 
-    // Scan entire document for hi-res URLs ending with ._AC_SL{digits}_.jpg
     const hiResMatches = Array.from(
-      document.documentElement.innerHTML.matchAll(
-        /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi
-      )
+      document.documentElement.innerHTML.matchAll(/https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi)
     ).map((m) => m[0]);
 
     additionalImageUrls = [...new Set([...additionalImageUrls, ...hiResMatches])];
 
-    // Remove obvious junk thumbs/sprites/overlays
     additionalImageUrls = additionalImageUrls.filter((src) => {
       if (!src) return false;
       const lower = src.toLowerCase();
-      return !(
-        lower.includes("sprite") ||
-        lower.includes("360_icon") ||
-        lower.includes("play-icon") ||
-        lower.includes("overlay") ||
-        lower.includes("fmjpg") ||
-        lower.includes("fmpng")
-      );
+      return !(lower.includes("sprite") || lower.includes("360_icon") || lower.includes("play-icon") || lower.includes("overlay") || lower.includes("fmjpg") || lower.includes("fmpng"));
     });
 
-    // Final pass: keep ANY _AC_SL{n}_ size, drop main
     const AC_ANY = /\._AC_SL\d+_\.jpg(?:\?.*)?$/i;
     additionalImageUrls = additionalImageUrls
       .filter((url) => url && url !== normalizedMain)
@@ -614,16 +466,13 @@ async function scrapeProductData(page) {
   }, title);
 }
 
-/**
- * Gemini OCR extraction (Brand + Price with currency)
- */
+/** Gemini OCR extraction (Brand + Price with currency) */
 async function geminiExtract(base64Image) {
   const prompt = `
 You are given a screenshot of an Amazon product page.
 Extract JSON with exactly these keys:
 - brand: string (brand or manufacturer name)
 - price: string (include currency symbol or ISO code, e.g., "$12.99" or "USD 12.99")
-
 Rules:
 - Return ONLY valid minified JSON: {"brand":"...","price":"..."}
 - If a field is unknown or not visible, use "Unspecified".`;
@@ -647,7 +496,7 @@ Rules:
   }
 }
 
-// ---------- Common utilities ----------
+/** URL/ASIN utils */
 function extractASINFromUrl(u = "") {
   try {
     const url = new URL(u);
@@ -668,40 +517,21 @@ function coerceASIN(input = "") {
   const m = s.match(/^[A-Z0-9]{8,10}$/i);
   return m ? m[0].toUpperCase() : "";
 }
+function includesCurrency(s = "") { return /[\p{Sc}]|\b[A-Z]{3}\b/u.test(s); }
+function currencyToken(s = "") { const m = s.match(/([\p{Sc}]|\b[A-Z]{3}\b)/u); return m ? m[1] : ""; }
 
-function includesCurrency(s = "") {
-  return /[\p{Sc}]|\b[A-Z]{3}\b/u.test(s);
-}
-function currencyToken(s = "") {
-  const m = s.match(/([\p{Sc}]|\b[A-Z]{3}\b)/u);
-  return m ? m[1] : "";
-}
-
-/**
- * Normalize Gemini price strings (fix superscripts, etc.)
- */
+/** Normalize Gemini price (fix superscripts, decimals, borrow currency) */
 function normalizeGeminiPrice(raw = "", domPrice = "") {
   let s = (raw || "").trim();
   if (!s) return "Unspecified";
-
   s = s.replace(/[\u00A0\u2009\u202F]/g, " ");
 
   const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]/.test(s);
-
-  const map = {
-    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
-    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
-    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
-    "₅": "5", "₆": "6", "⁷": "7", "₈": "8", "₉": "9",
-  };
+  const map = { "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4","⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9","₀":"0","₁":"1","₂":"2","₃":"3","₄":"4","₅":"5","₆":"6","₇":"7","₈":"8","₉":"9" };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
 
-  if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) {
-    s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
-  }
-  if (!/\d\.\d{2,}/.test(s) && /(\d+)\s+(\d{2})\b/.test(s)) {
-    s = s.replace(/(\d+)\s+(\d{2})\b/, "$1.$2");
-  }
+  if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
+  if (!/\d\.\d{2,}/.test(s) && /(\d+)\s+(\d{2})\b/.test(s)) s = s.replace(/(\d+)\s+(\d{2})\b/, "$1.$2");
 
   if (hadSuper && !/\d\.\d{2,}/.test(s)) {
     const digits = (s.match(/\d+/g) || []).join("");
@@ -711,12 +541,10 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
       s = cur ? `${cur} ${num}` : num;
     }
   }
-
   if (!includesCurrency(s) && includesCurrency(domPrice)) {
     const cur = currencyToken(domPrice);
     if (cur) s = `${cur} ${s}`;
   }
-
   s = s.replace(/\s+/g, " ").trim();
   return s || "Unspecified";
 }
@@ -735,45 +563,23 @@ async function isCamelVerificationGate(page) {
         /challenge-platform|turnstile|cloudflare/i.test(document.documentElement.outerHTML);
       return { inner, hasCf };
     });
-    return (
-      hasCf ||
-      inner.includes("verifying you are human") ||
-      inner.includes("checking your browser before accessing")
-    );
-  } catch {
-    return false;
-  }
+    return hasCf || inner.includes("verifying you are human") || inner.includes("checking your browser before accessing");
+  } catch { return false; }
 }
 
-// Fallback: fetch similar fields from Amazon by ASIN
+/** Amazon-derived fields by ASIN (using an EXISTING context) */
 async function scrapeAmazonFieldsByASIN(context, asin) {
   const page = await context.newPage();
   const url = `https://www.amazon.com/dp/${asin}`;
   await safeGoto(page, url, { retries: 1, timeout: 60000 });
   await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
-
   const vals = await page.evaluate(() => {
-    const clean = (s) =>
-      (s || "")
-        .replace(/\u00AD|\u200B|\u2060|\uFEFF/g, "") // soft hyphen/ZW spaces
-        .replace(/\u00A0/g, " ")                     // nbsp -> space
-        .replace(/\s+/g, " ")
-        .trim();
-
-    // Search common product detail tables + bullet lists
+    const clean = (s) => (s || "").replace(/\u00AD|\u200B|\u2060|\uFEFF/g, "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
     const findInTables = (labelRe) => {
-      const scopes = [
-        "#productDetails_techSpec_section_1",
-        "#productDetails_detailBullets_sections1",
-        "#prodDetails",
-        ".prodDetTable",
-        "#detailBullets_feature_div",
-      ];
+      const scopes = ["#productDetails_techSpec_section_1","#productDetails_detailBullets_sections1","#prodDetails",".prodDetTable","#detailBullets_feature_div"];
       for (const sel of scopes) {
         const root = document.querySelector(sel);
         if (!root) continue;
-
-        // table rows
         const rows = Array.from(root.querySelectorAll("tr"));
         for (const tr of rows) {
           const cells = tr.querySelectorAll("th,td");
@@ -782,7 +588,6 @@ async function scrapeAmazonFieldsByASIN(context, asin) {
           const value = clean(cells[1].innerText || cells[1].textContent || "");
           if (labelRe.test(label)) return value;
         }
-        // bullet-style "Label: Value"
         const bullets = Array.from(root.querySelectorAll("li"));
         for (const li of bullets) {
           const txt = clean(li.innerText || li.textContent || "");
@@ -792,182 +597,164 @@ async function scrapeAmazonFieldsByASIN(context, asin) {
       }
       return "";
     };
-
-    // Breadcrumbs for product group/category
-    const crumbs = Array.from(
-      document.querySelectorAll("#wayfinding-breadcrumbs_feature_div ul li a")
-    )
-      .map((a) => clean(a.innerText || a.textContent || ""))
-      .filter(Boolean);
-
+    const crumbs = Array.from(document.querySelectorAll("#wayfinding-breadcrumbs_feature_div ul li a"))
+      .map((a) => clean(a.innerText || a.textContent || "")).filter(Boolean);
     const productGroup = crumbs[0] || "";
     const category = crumbs.join(" > ") || "";
-
-    const manufacturer =
-      findInTables(/manufacturer/i) || clean(document.querySelector("#bylineInfo")?.innerText || "");
-
-    // “List Price” sometimes appears in tables or price box (strikethrough)
-    const listPrice =
-      findInTables(/list\s*price/i) || clean(document.querySelector("#price .a-text-price")?.innerText || "");
-
+    const manufacturer = findInTables(/manufacturer/i) || clean(document.querySelector("#bylineInfo")?.innerText || "");
+    const listPrice = findInTables(/list\s*price/i) || clean(document.querySelector("#price .a-text-price")?.innerText || "");
     const upc = findInTables(/\bUPC\b/i);
-
     return { productGroup, category, manufacturer, listPrice, upc };
   });
 
   let shot = "";
-  try {
-    const buf = await page.screenshot({ type: "png" });
-    shot = buf.toString("base64");
-  } catch {}
+  try { const buf = await page.screenshot({ type: "png" }); shot = buf.toString("base64"); } catch {}
   try { await page.close(); } catch {}
-
   return { ...vals, screenshot: shot, url };
 }
 
-/**
- * Run a task and auto-rescue if the page/context was closed.
- * If closed, adopt another alive page or open a fresh one and reload the URL, then retry once.
- */
+/** Standalone Amazon fallback: spins up a NEW browser even if Camel/browser died */
+async function amazonFallbackStandalone(asin) {
+  const width = 1280, height = 800;
+  let browser, context, page;
+  try {
+    ({ browser, context, page } = await minimalContext(width, height));
+    const url = `https://www.amazon.com/dp/${asin}`;
+    await safeGoto(page, url, { retries: 1, timeout: 60000 });
+    await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
+    const vals = await page.evaluate(() => {
+      const clean = (s) => (s || "").replace(/\u00AD|\u200B|\u2060|\uFEFF/g, "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
+      const findInTables = (labelRe) => {
+        const scopes = ["#productDetails_techSpec_section_1","#productDetails_detailBullets_sections1","#prodDetails",".prodDetTable","#detailBullets_feature_div"];
+        for (const sel of scopes) {
+          const root = document.querySelector(sel);
+          if (!root) continue;
+          const rows = Array.from(root.querySelectorAll("tr"));
+          for (const tr of rows) {
+            const cells = tr.querySelectorAll("th,td");
+            if (cells.length < 2) continue;
+            const label = clean(cells[0].innerText || cells[0].textContent || "");
+            const value = clean(cells[1].innerText || cells[1].textContent || "");
+            if (labelRe.test(label)) return value;
+          }
+          const bullets = Array.from(root.querySelectorAll("li"));
+          for (const li of bullets) {
+            const txt = clean(li.innerText || li.textContent || "");
+            const m = txt.match(/^([^:]+):\s*(.+)$/);
+            if (m && labelRe.test(m[1])) return clean(m[2]);
+          }
+        }
+        return "";
+      };
+      const crumbs = Array.from(document.querySelectorAll("#wayfinding-breadcrumbs_feature_div ul li a"))
+        .map((a) => clean(a.innerText || a.textContent || "")).filter(Boolean);
+      const productGroup = crumbs[0] || "";
+      const category = crumbs.join(" > ") || "";
+      const manufacturer = findInTables(/manufacturer/i) || clean(document.querySelector("#bylineInfo")?.innerText || "");
+      const listPrice = findInTables(/list\s*price/i) || clean(document.querySelector("#price .a-text-price")?.innerText || "");
+      const upc = findInTables(/\bUPC\b/i);
+      return { productGroup, category, manufacturer, listPrice, upc };
+    });
+    let shot = "";
+    try { const buf = await page.screenshot({ type: "png" }); shot = buf.toString("base64"); } catch {}
+    return { ...vals, screenshot: shot, url: page.url() };
+  } finally {
+    try { for (const p of context?.pages?.() || []) if (!p.isClosed()) await p.close({ runBeforeUnload: false }); } catch {}
+    try { await browser?.close(); } catch {}
+  }
+}
+
+/** Rescue wrapper: re-adopt or reopen+reload Camel URL, then retry once */
 async function withPageAlive(page, context, reloadUrl, workFn) {
   try {
     ensureAlive(page);
     return await workFn(page);
   } catch (err) {
     if (!isClosedErr(err)) throw err;
-
-    // Try to adopt an existing alive page
     let p;
-    try {
-      p = await adoptActivePageOrThrow(page, context);
-    } catch {
-      // Open a fresh page and navigate back
+    try { p = await adoptActivePageOrThrow(page, context); }
+    catch {
       p = await context.newPage();
       await safeGoto(p, reloadUrl, { retries: 1, timeout: 60000 });
       await p.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
     }
-
     ensureAlive(p);
     return await workFn(p);
   }
 }
 
 // ---------- endpoints ----------
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.send("✅ Scraper is up (Amazon + CamelCamelCamel).");
 });
 
-/**
- * AMAZON endpoint
- * Supports mode=product (default) and mode=links
- */
+/** AMAZON endpoint */
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
-  const mode = String(req.query.mode || "product").toLowerCase(); // "product" | "links"
+  const mode = String(req.query.mode || "product").toLowerCase();
   const force = req.query.force === "1" || req.query.force === "true";
-
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
 
   const width = 1280, height = 800;
-
   let browser, context, page;
   try {
-    const ctx = await minimalContext(width, height);
-    browser = ctx.browser;
-    context = ctx.context;
-    page = ctx.page;
+    ({ browser, context, page } = await minimalContext(width, height));
 
-    // Navigate & handle side-sheets/continue shopping
     await safeGoto(page, url, { retries: 2, timeout: 60000 });
     page = await handleContinueShopping(page, context, url);
     ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
 
-    // Decide page type once (used by both modes)
     let productLike;
-    try {
-      productLike = await isProductPage(page);
-    } catch (e) {
+    try { productLike = await isProductPage(page); }
+    catch (e) {
       if (isClosedErr(e)) {
         page = await adoptActivePageOrThrow(page, context);
         await sleep(200);
         productLike = await isProductPage(page);
-      } else {
-        throw e;
-      }
+      } else throw e;
     }
 
-    // ---------- MODE: LINKS ----------
     if (mode === "links") {
       if (productLike && !force) {
         const buf = await safeScreenshot(page, { type: "png" }, 1);
         return res.json({
-          ok: true,
-          url: page.url(),
-          pageType: "product",
+          ok: true, url: page.url(), pageType: "product",
           note: 'On product page; skipping links/buttons (pass ?force=1 to override).',
-          screenshot: buf.toString("base64"),
-          counts: { links: 0, buttons: 0 },
-          links: [],
-          buttons: [],
+          screenshot: buf.toString("base64"), counts: { links: 0, buttons: 0 }, links: [], buttons: [],
         });
       }
-
-      const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({
-        links: [],
-        buttons: [],
-        counts: { links: 0, buttons: 0 },
-      }));
+      const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({ links: [], buttons: [], counts: { links: 0, buttons: 0 } }));
       const buf = await safeScreenshot(page, { type: "png" }, 1);
-
-      return res.json({
-        ok: true,
-        url: page.url(),
-        pageType: productLike ? "product" : "nonProduct",
-        counts,
-        links,
-        buttons,
-        screenshot: buf.toString("base64"),
-      });
+      return res.json({ ok: true, url: page.url(), pageType: productLike ? "product" : "nonProduct", counts, links, buttons, screenshot: buf.toString("base64") });
     }
 
-    // ---------- MODE: PRODUCT (default) ----------
     await sleep(jitter(300, 400));
 
-    // Scrape Playwright fields (retry once if page was swapped)
     let scraped;
-    try {
-      scraped = await scrapeProductData(page);
-    } catch (e) {
+    try { scraped = await scrapeProductData(page); }
+    catch (e) {
       if (isClosedErr(e)) {
         page = await adoptActivePageOrThrow(page, context);
         await sleep(200);
         scraped = await scrapeProductData(page);
-      } else {
-        throw e;
-      }
+      } else throw e;
     }
 
     ensureAlive(page, "Page closed before screenshot");
 
-    // Screenshot for OCR
     let buf;
-    try {
-      buf = await safeScreenshot(page, { type: "png" }, 1);
-    } catch (e) {
+    try { buf = await safeScreenshot(page, { type: "png" }, 1); }
+    catch (e) {
       if (isClosedErr(e)) {
         page = await adoptActivePageOrThrow(page, context);
         buf = await safeScreenshot(page, { type: "png" }, 1);
-      } else {
-        throw e;
-      }
+      } else throw e;
     }
     const base64 = buf.toString("base64");
 
-    // Gemini OCR (brand + price) and price normalization
     const gemini = await geminiExtract(base64);
     const priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
 
-    // ASIN & final response
     const resolvedUrl = page.url() || url;
     const asin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(url);
 
@@ -995,45 +782,34 @@ app.get("/scrape", async (req, res) => {
   }
 });
 
-/**
- * CAMELCAMELCAMEL endpoint (with verification detection + Amazon fallback + page-rescue)
- * /camel?url=<amazon-url-or-asin>
- */
+/** CAMEL endpoint (robust + guaranteed fallback) */
 app.get("/camel", async (req, res) => {
   const inputUrl = req.query.url || "";
   const asin = coerceASIN(inputUrl);
-  if (!asin) {
-    return res.status(400).json({ ok: false, error: "Could not determine ASIN from url" });
-  }
+  if (!asin) return res.status(400).json({ ok: false, error: "Could not determine ASIN from url" });
 
   const camelUrl = `https://camelcamelcamel.com/product/${asin}`;
   const width = 1280, height = 800;
 
   let browser, context, page;
   try {
-    const ctx = await minimalContext(width, height);
-    browser = ctx.browser;
-    context = ctx.context;
-    page = ctx.page;
+    ({ browser, context, page } = await minimalContext(width, height));
 
     await safeGoto(page, camelUrl, { retries: 2, timeout: 60000 });
     await page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => {});
 
-    // Give the challenge a brief chance to auto-complete
+    // Let challenge auto-complete briefly (if ever)
     await withPageAlive(page, context, camelUrl, (p) =>
-      p
-        .waitForFunction(
-          () => !/verifying you are human/i.test(document.body?.innerText || ""),
-          { timeout: 8000 }
-        )
-        .catch(() => null)
+      p.waitForFunction(
+        () => !/verifying you are human/i.test(document.body?.innerText || ""),
+        { timeout: 8000 }
+      ).catch(() => null)
     );
 
     const challenged = await withPageAlive(page, context, camelUrl, (p) => isCamelVerificationGate(p));
-
     if (challenged) {
-      // Fallback to Amazon-derived values
-      const fb = await scrapeAmazonFieldsByASIN(context, asin);
+      // Use standalone Amazon fallback so we succeed even if Camel/browser dies next
+      const fb = await amazonFallbackStandalone(asin);
       return res.json({
         ok: true,
         source: "amazon-fallback",
@@ -1049,13 +825,13 @@ app.get("/camel", async (req, res) => {
       });
     }
 
-    // Not challenged → parse Camel table (auto-rescue if page closes)
+    // Parse Camel table (auto-rescue if page closes)
     const details = await withPageAlive(page, context, camelUrl, (p) =>
       p.evaluate(() => {
         const cleanText = (node) =>
           (node?.innerText || node?.textContent || "")
-            .replace(/\u00AD|\u200B|\u2060|\uFEFF/g, "") // soft hyphen/ZW spaces
-            .replace(/\u00A0/g, " ")                    // nbsp -> space
+            .replace(/\u00AD|\u200B|\u2060|\uFEFF/g, "")
+            .replace(/\u00A0/g, " ")
             .replace(/\s+/g, " ")
             .trim();
 
@@ -1067,10 +843,8 @@ app.get("/camel", async (req, res) => {
         for (const tr of rows) {
           const tds = tr.querySelectorAll("td");
           if (tds.length < 2) continue;
-
           const label = cleanText(tds[0]).toLowerCase();
           const value = cleanText(tds[1]);
-
           if (!label) continue;
           if (/product\s*group/.test(label)) out.productGroup = value;
           else if (/category/.test(label)) out.category = value;
@@ -1097,15 +871,15 @@ app.get("/camel", async (req, res) => {
       upc: details.upc || "Unspecified",
       screenshot: base64,
     });
-  } catch (err) {
-    // Last-resort: try Amazon fallback instead of 500
+  } catch (_err) {
+    // ANY failure → succeed with Amazon fallback (fresh browser)
     try {
-      const fb = await scrapeAmazonFieldsByASIN(context, coerceASIN(req.query.url || ""));
+      const fb = await amazonFallbackStandalone(asin);
       return res.json({
         ok: true,
         source: "amazon-fallback",
         url: fb.url || "",
-        ASIN: coerceASIN(req.query.url || "") || "Unspecified",
+        ASIN: asin,
         productGroup: fb.productGroup || "Unspecified",
         category: fb.category || "Unspecified",
         manufacturer: fb.manufacturer || "Unspecified",
@@ -1114,8 +888,8 @@ app.get("/camel", async (req, res) => {
         screenshot: fb.screenshot || "",
         note: "Recovered from error; returned Amazon-derived fields instead.",
       });
-    } catch {
-      return res.status(500).json({ ok: false, error: err?.message || String(err) });
+    } catch (err2) {
+      return res.status(500).json({ ok: false, error: err2?.message || String(err2) });
     }
   } finally {
     try { for (const p of context?.pages?.() || []) if (!p.isClosed()) await p.close({ runBeforeUnload: false }); } catch {}
