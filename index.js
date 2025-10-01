@@ -1,7 +1,6 @@
-// index.js
-// Express + Playwright + Gemini OCR (hardened)
+ // index.js
+// Express + Playwright + Gemini OCR
 // Scrapes Amazon product info via DOM + Gemini OCR on screenshot
-// Defensive against racy "Continue/Keep shopping" flows, tab closures, and slow navs.
 //
 // GET /scrape?url=...
 
@@ -13,7 +12,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// --- CORS (Airtable right-panel scripting allowed) ---
+// Allow browser requests from Airtable (right panel scripting)
 app.use(
   cors({
     origin: [/^https:\/\/airtable\.com$/, /^https:\/\/.*\.airtableblocks\.com$/],
@@ -21,28 +20,17 @@ app.use(
   })
 );
 
-// --- Gemini client ---
+// Gemini client
 if (!process.env.GEMINI_API_KEY) {
   console.error("❌ Missing GEMINI_API_KEY in environment");
   process.exit(1);
 }
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// Keep this aligned with your current working model
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-// --- helpers ---
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
-
-function ensureAlive(page, msg = "Page is closed") {
-  if (!page || page.isClosed()) throw new Error(msg);
-}
-function isClosedErr(err) {
-  const msg = (err && err.message) || String(err || "");
-  return /Target page, context or browser has been closed/i.test(msg);
-}
-
-// --- Playwright context (minimal but hardened) ---
+/**
+ * Minimal Playwright context
+ */
 async function minimalContext(width, height) {
   const browser = await chromium.launch({
     headless: true,
@@ -52,7 +40,6 @@ async function minimalContext(width, height) {
       "--disable-blink-features=AutomationControlled",
       "--disable-dev-shm-usage",
       "--disable-gpu",
-      "--window-size=1280,800",
     ],
   });
 
@@ -66,66 +53,33 @@ async function minimalContext(width, height) {
 
   const page = await context.newPage();
 
-  // De-automation fingerprints
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
-    // A bit more "realism"
-    Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-    Object.defineProperty(navigator, "platform", { get: () => "Win32" });
   });
 
   await page.setExtraHTTPHeaders({
     "accept-language": "en-US,en;q=0.9",
   });
 
+  // Return context so we can adopt new pages/popups later
   return { browser, context, page };
 }
 
-// --- Soft block detection ---
-function isRobotCheckUrl(url) {
-  if (!url) return false;
-  return (
-    url.includes("/errors/validateCaptcha") ||
-    url.includes("/captcha") ||
-    url.includes("/sorry")
-  );
-}
-async function looksBlocked(page) {
-  try {
-    const url = page.url();
-    if (isRobotCheckUrl(url)) return true;
-    const title = (await page.title().catch(() => "")) || "";
-    if (/robot check|captcha/i.test(title)) return true;
-    const bodyText = await page.evaluate(() => document.body?.innerText || "");
-    if (/enter the characters|type the characters|sorry|robot check|captcha/i.test(bodyText)) {
-      return true;
-    }
-  } catch {}
-  return false;
+/**
+ * Simple helpers
+ */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
+
+function ensureAlive(page, msg = "Page is closed") {
+  if (!page || page.isClosed()) throw new Error(msg);
 }
 
-// --- Nav with retry + block check ---
-async function safeGoto(page, url, { retries = 2, timeout = 70000 } = {}) {
-  let attempt = 0, lastErr;
-  while (attempt <= retries) {
-    try {
-      await sleep(jitter(250, 500));
-      await page.goto(url, { timeout, waitUntil: "commit" });
-      // allow render/redirects to settle
-      await sleep(jitter(800, 800));
-      if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
-      return;
-    } catch (err) {
-      lastErr = err;
-      if (page.isClosed()) throw lastErr;
-      if (attempt < retries) await sleep(jitter(1200, 1500));
-      attempt++;
-    }
-  }
-  throw lastErr || new Error("Navigation failed");
+function isClosedErr(err) {
+  const msg = (err && err.message) || String(err || "");
+  return /Target page, context or browser has been closed/i.test(msg);
 }
 
-// --- Adopt most plausible active page ---
 async function adoptActivePageOrThrow(currentPage, context) {
   if (currentPage && !currentPage.isClosed()) return currentPage;
   const pages = context.pages().filter((p) => !p.isClosed());
@@ -140,7 +94,65 @@ async function adoptActivePageOrThrow(currentPage, context) {
   throw new Error("All pages are closed");
 }
 
-// --- Close "Added to Cart" side sheet if visible (non-fatal) ---
+function isRobotCheckUrl(url) {
+  if (!url) return false;
+  return (
+    url.includes("/errors/validateCaptcha") ||
+    url.includes("/captcha") ||
+    url.includes("/sorry")
+  );
+}
+
+async function looksBlocked(page) {
+  try {
+    const url = page.url();
+    if (isRobotCheckUrl(url)) return true;
+
+    const title = (await page.title().catch(() => "")) || "";
+    if (/robot check/i.test(title) || /captcha/i.test(title)) return true;
+
+    const bodyText = await page.evaluate(() => document.body?.innerText || "");
+    if (
+      /enter the characters/i.test(bodyText) ||
+      /type the characters/i.test(bodyText) ||
+      /sorry/i.test(bodyText)
+    ) {
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+/**
+ * Navigation with retry + CAPTCHA detection
+ */
+async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
+  let attempt = 0;
+  let lastErr;
+
+  while (attempt <= retries) {
+    try {
+      await sleep(jitter(250, 500));
+      await page.goto(url, { timeout, waitUntil: "commit" });
+      await sleep(jitter(700, 600));
+
+      if (await looksBlocked(page)) {
+        throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (page.isClosed()) throw lastErr;
+      if (attempt < retries) await sleep(jitter(1000, 1500));
+      attempt++;
+    }
+  }
+  throw lastErr || new Error("Navigation failed");
+}
+
+/**
+ * Close the "Added to Cart" side sheet if visible
+ */
 async function closeAttachSideSheetIfVisible(page) {
   try {
     const closed = await page.evaluate(() => {
@@ -162,46 +174,15 @@ async function closeAttachSideSheetIfVisible(page) {
       return false;
     });
     return !!closed;
-  } catch { return false; }
-}
-
-// --- Robust click with retries + gentle mouse move ---
-async function clickLocatorWithRetry(page, locator, {
-  attempts = 3,
-  visibleTimeout = 1500,
-  betweenMs = [180, 420], // jitter
-} = {}) {
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const el = locator.first();
-      const ok = await el.isVisible({ timeout: visibleTimeout }).catch(() => false);
-      if (!ok) throw new Error("continue-shopping candidate not visible");
-      try { await el.scrollIntoViewIfNeeded(); } catch {}
-      try {
-        const box = await el.boundingBox().catch(() => null);
-        if (box) {
-          const cx = box.x + box.width / 2;
-          const cy = box.y + box.height / 2;
-          await page.mouse.move(cx + 0.1, cy + 0.1, { steps: 12 });
-        }
-      } catch {}
-      await el.click({ timeout: 2500 });
-      return true;
-    } catch (e) {
-      if (i < attempts - 1) {
-        const wait = betweenMs[0] + Math.floor(Math.random() * (betweenMs[1] - betweenMs[0]));
-        await page.waitForTimeout(wait);
-        continue;
-      }
-      return false;
-    }
+  } catch {
+    return false;
   }
-  return false;
 }
 
-// --- Detect & click "Continue/Keep shopping" robustly ---
+/**
+ * Detect & click "Continue/Keep shopping" if present
+ */
 async function clickContinueShoppingIfPresent(page) {
-  // 0) Close side sheet if it exists (common on add-to-cart)
   if (await closeAttachSideSheetIfVisible(page)) {
     return true;
   }
@@ -220,138 +201,97 @@ async function clickContinueShoppingIfPresent(page) {
     '#attach-close_sideSheet-link',
   ];
 
-  // 1) Known selectors (with retries)
   for (const sel of KNOWN_SELECTORS) {
     try {
-      const ok = await clickLocatorWithRetry(page, page.locator(sel), {
-        attempts: 3,
-        visibleTimeout: 1500,
-      });
-      if (ok) return true;
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 500 }).catch(() => false)) {
+        await el.click({ timeout: 2000 }).catch(() => {});
+        return true;
+      }
     } catch {}
   }
 
-  // 2) Text-only locators
   try {
     const textLoc = page.locator(
-      'button:has-text("Continue shopping"), a:has-text("Continue shopping"), ' +
-      '[role="button"]:has-text("Continue shopping"), ' +
-      'button:has-text("Keep shopping"), a:has-text("Keep shopping")'
+      'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping"), button:has-text("Keep shopping"), a:has-text("Keep shopping")'
     );
-    const ok = await clickLocatorWithRetry(page, textLoc, { attempts: 3, visibleTimeout: 1500 });
-    if (ok) return true;
-  } catch {}
-
-  // 3) Last-resort DOM sweep, retried (guard for racy closes)
-  for (let i = 0; i < 3; i++) {
-    try {
-      const clicked = await page.evaluate(() => {
-        const nodes = Array.from(
-          document.querySelectorAll('button, a, input[type="submit"], div[role="button"]')
-        );
-        const target = nodes.find((n) => {
-          const txt = ((n.innerText || n.value || "") + "").toLowerCase();
-          return txt.includes("continue shopping") || txt.includes("keep shopping");
-        });
-        if (target) {
-          target.scrollIntoView?.({ block: "center", inline: "center" });
-          target.click();
-          return true;
-        }
-        return false;
-      });
-      if (clicked) return true;
-    } catch {
-      // If evaluate throws because the page navigated/closed, treat as likely-click
+    if (await textLoc.first().isVisible({ timeout: 500 }).catch(() => false)) {
+      await textLoc.first().click({ timeout: 2000 }).catch(() => {});
       return true;
     }
-    await page.waitForTimeout(220 + Math.floor(Math.random() * 220));
-  }
+  } catch {}
+
+  try {
+    const clicked = await page.evaluate(() => {
+      const nodes = Array.from(
+        document.querySelectorAll('button, a, input[type="submit"], div[role="button"]')
+      );
+      const target = nodes.find((n) => {
+        const txt = ((n.innerText || n.value || "") + "").toLowerCase();
+        return txt.includes("continue shopping") || txt.includes("keep shopping");
+      });
+      if (target) {
+        target.scrollIntoView?.({ block: "center", inline: "center" });
+        target.click();
+        return true;
+      }
+      return false;
+    });
+    if (clicked) return true;
+  } catch {}
 
   return false;
 }
 
-// --- Wait for any signal of change after click ---
-async function waitAny(page, context, { pageTimeout = 9000, navTimeout = 20000 } = {}) {
-  return await Promise.race([
-    context.waitForEvent("page", { timeout: pageTimeout }).catch(() => null),
-    page?.waitForNavigation({ timeout: navTimeout, waitUntil: "commit" }).catch(() => null),
-    page?.waitForLoadState("domcontentloaded", { timeout: navTimeout }).catch(() => null),
-  ]);
-}
-
-// --- Adopt active or create a fresh one and (optionally) reload ---
-async function ensureFreshOrAdopt(page, context, fallbackUrl) {
-  // scan a few times to catch late-opening tabs
-  for (let i = 0; i < 4; i++) {
-    const pages = context.pages().filter((p) => !p.isClosed());
-    for (let j = pages.length - 1; j >= 0; j--) {
-      const p = pages[j];
-      const u = p.url();
-      if (u && u !== "about:blank" && !p.isClosed()) {
-        try { await p.bringToFront(); } catch {}
-        return p;
-      }
-    }
-    if (pages[0]) return pages[0];
-    await sleep(200 + Math.floor(Math.random() * 160));
-  }
-  // nothing → create new
-  const fresh = await context.newPage();
-  try { await fresh.bringToFront(); } catch {}
-  if (fallbackUrl) await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 70000 });
-  return fresh;
-}
-
-// --- Handle continue/keep shopping clicks robustly ---
+/**
+ * Handle "Continue/Keep shopping" and return a guaranteed alive page.
+ * If Amazon kills the tab and no replacement appears, open a **new page**
+ * and reload the provided fallback URL.
+ */
 async function handleContinueShopping(page, context, fallbackUrl) {
   try {
-    const beforeClosed = !page || page.isClosed();
-    const beforeUrl = beforeClosed ? "" : page.url();
-
     const clicked = await clickContinueShoppingIfPresent(page);
+    if (!clicked) return page;
 
-    // Edge-case: evaluate clicked but returned false; detect change anyway
-    if (!clicked) {
-      if (!page || page.isClosed()) {
-        return await ensureFreshOrAdopt(page, context, fallbackUrl);
-      }
-      const afterUrl = page.url();
-      if (afterUrl && afterUrl !== beforeUrl) {
-        await waitAny(page, context);
-        const adopted = await ensureFreshOrAdopt(page, context, null);
-        if (adopted && !adopted.isClosed()) return adopted;
-        return await ensureFreshOrAdopt(page, context, fallbackUrl);
-      }
-      // nothing happened, keep current
-      return page;
+    const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
+    const navPromise = page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }).catch(() => null);
+    const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => null);
+
+    await Promise.race([popupPromise, navPromise, dclPromise]);
+
+    const pages = context.pages();
+    const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
+    if (active && active !== page) {
+      try { await active.bringToFront(); } catch {}
+      return active;
     }
 
-    // Normal path: we know a click attempt happened
-    await waitAny(page, context);
-    let adopted = await ensureFreshOrAdopt(page, context, null);
-    if (adopted && !adopted.isClosed()) return adopted;
+    if (page && !page.isClosed()) return page;
 
-    // If still no luck and page alive, try one more click & wait
-    if (page && !page.isClosed()) {
-      const clickedAgain = await clickContinueShoppingIfPresent(page);
-      if (clickedAgain) {
-        await waitAny(page, context);
-        adopted = await ensureFreshOrAdopt(page, context, null);
-        if (adopted && !adopted.isClosed()) return adopted;
-      }
+    const fresh = await context.newPage();
+    try { await fresh.bringToFront(); } catch {}
+    if (fallbackUrl) {
+      await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
     }
-
-    // Final fallback: fresh page
-    return await ensureFreshOrAdopt(page, context, fallbackUrl);
+    return fresh;
   } catch {
-    const adopted = await ensureFreshOrAdopt(page, context, null);
-    if (adopted && !adopted.isClosed()) return adopted;
-    return await ensureFreshOrAdopt(page, context, fallbackUrl);
+    try {
+      const adopted = await adoptActivePageOrThrow(page, context);
+      return adopted;
+    } catch {
+      const fresh = await context.newPage();
+      try { await fresh.bringToFront(); } catch {}
+      if (fallbackUrl) {
+        await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
+      }
+      return fresh;
+    }
   }
 }
 
-// --- Safer screenshot with retry ---
+/**
+ * Safer screenshot with a small retry
+ */
 async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
@@ -361,15 +301,22 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
     } catch (err) {
       lastErr = err;
       const msg = (err && err.message) || String(err);
-      if (isClosedErr(err)) throw new Error("Screenshot failed: " + msg);
-      if (i < retries) { await sleep(jitter(250, 500)); continue; }
+      if (/Target page, context or browser has been closed/i.test(msg)) {
+        throw new Error("Screenshot failed: " + msg);
+      }
+      if (i < retries) {
+        await sleep(jitter(250, 500));
+        continue;
+      }
       throw new Error("Screenshot failed: " + msg);
     }
   }
   throw lastErr || new Error("Screenshot failed");
 }
 
-// --- Product page heuristic ---
+/**
+ * Heuristic: are we on a proper Amazon product page?
+ */
 async function isProductPage(page) {
   try {
     return await page.evaluate(() => {
@@ -391,13 +338,23 @@ async function isProductPage(page) {
 
       return (urlFlag && hasTitle && layoutHints) || ((hasTitle || hasByline) && hasBuyCtas);
     });
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
-// --- Extract links/buttons if we aren't on a product page ---
+/**
+ * Extract all <a> and button-like elements (used on non-product pages)
+ */
 async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
   return await page.evaluate((limits) => {
-    const toAbs = (u) => { try { return u ? new URL(u, location.href).href : ""; } catch { return u || ""; } };
+    const toAbs = (u) => {
+      try {
+        return u ? new URL(u, location.href).href : "";
+      } catch {
+        return u || "";
+      }
+    };
     const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
 
     const linkNodes = Array.from(document.querySelectorAll("a"));
@@ -439,40 +396,61 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
       };
     });
 
-    // de-dupe
-    const seenL = new Set(), dedupLinks = [];
+    // Simple de-dupe
+    const seenL = new Set();
+    const dedupLinks = [];
     for (const l of links) {
       const k = `${l.href}|${l.text}`;
-      if (l.href && !seenL.has(k)) { seenL.add(k); dedupLinks.push(l); }
-    }
-    const seenB = new Set(), dedupButtons = [];
-    for (const b of buttons) {
-      const k = `${b.text}|${b.id}`;
-      if (!seenB.has(k)) { seenB.add(k); dedupButtons.push(b); }
+      if (l.href && !seenL.has(k)) {
+        seenL.add(k);
+        dedupLinks.push(l);
+      }
     }
 
-    return { links: dedupLinks, buttons: dedupButtons, counts: { links: links.length, buttons: buttons.length } };
+    const seenB = new Set();
+    const dedupButtons = [];
+    for (const b of buttons) {
+      const k = `${b.text}|${b.id}`;
+      if (!seenB.has(k)) {
+        seenB.add(k);
+        dedupButtons.push(b);
+      }
+    }
+
+    return {
+      links: dedupLinks,
+      buttons: dedupButtons,
+      counts: { links: links.length, buttons: buttons.length },
+    };
   }, limits);
 }
 
-// --- Product scraping (Playwright side) ---
+/**
+ * Scrape product data from DOM (Playwright-only fields)
+ * NOTE: Brand is NOT scraped here (Gemini OCR handles brand).
+ */
 async function scrapeProductData(page) {
   const title =
     (await page.textContent("#productTitle").catch(() => null)) ||
     (await page.textContent("#title").catch(() => null));
 
   return await page.evaluate((title) => {
+    // -------- Item Form (prefer Product Overview row .po-item_form) --------
     const itemForm = (() => {
+      // 1) Primary: <tr class="... po-item_form ..."> → value in 2nd <td>
       const row =
         document.querySelector("tr.po-item_form") ||
         document.querySelector('tr[class*="po-item_form"]');
       if (row) {
         const tds = row.querySelectorAll("td");
         if (tds.length >= 2) {
-          const text = (tds[1].innerText || tds[1].textContent || "").replace(/\s+/g, " ").trim();
+          const text = (tds[1].innerText || tds[1].textContent || "")
+            .replace(/\s+/g, " ")
+            .trim();
           if (text) return text;
         }
       }
+      // 2) Any row where first <td> label contains "Item Form"
       const altRow = Array.from(document.querySelectorAll("tr")).find((tr) => {
         const firstTd = tr.querySelector("td");
         if (!firstTd) return false;
@@ -482,31 +460,43 @@ async function scrapeProductData(page) {
       if (altRow) {
         const tds = altRow.querySelectorAll("td");
         if (tds.length >= 2) {
-          const text = (tds[1].innerText || tds[1].textContent || "").replace(/\s+/g, " ").trim();
+          const text = (tds[1].innerText || tds[1].textContent || "")
+            .replace(/\s+/g, " ")
+            .trim();
           if (text) return text;
         }
       }
-      const li = Array.from(document.querySelectorAll("#detailBullets_feature_div li, li"))
-        .find((el) => /item\s*form/i.test(el.innerText || el.textContent || ""));
+      // 3) Fallback: bullet or list: "Item Form: Lotion"
+      const li = Array.from(
+        document.querySelectorAll("#detailBullets_feature_div li, li")
+      ).find((el) => /item\s*form/i.test(el.innerText || el.textContent || ""));
       if (li) {
-        const raw = (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim();
+        const raw = (li.innerText || li.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
         const m = raw.match(/item\s*form\s*[:\-]?\s*(.+)$/i);
         if (m && m[1]) return m[1].trim();
       }
       return "";
     })();
 
+    // -------- Price (ensure currency) --------
     const getPriceWithCurrency = () => {
       const priceEl =
         document.querySelector(".a-price .a-offscreen") ||
         document.querySelector("#priceblock_ourprice, #priceblock_dealprice, #priceblock_saleprice");
       let text = (priceEl?.textContent || "").trim();
+
       const hasCurrency = /[\p{Sc}]|\b[A-Z]{3}\b/u.test(text);
       if (text && !hasCurrency) {
         const sym = document.querySelector(".a-price .a-price-symbol")?.textContent?.trim() || "";
-        if (sym) text = sym + text;
-        else {
-          const iso = document.querySelector('meta[property="og:price:currency"]')?.getAttribute("content") || "";
+        if (sym) {
+          text = sym + text;
+        } else {
+          const iso =
+            document
+              .querySelector('meta[property="og:price:currency"]')
+              ?.getAttribute("content") || "";
           if (iso) text = iso + " " + text;
         }
       }
@@ -514,6 +504,7 @@ async function scrapeProductData(page) {
     };
     const price = getPriceWithCurrency();
 
+    // -------- Featured bullets (each item prefixed with "• " and suffixed with " ") --------
     const featuredBullets = (() => {
       const items = Array.from(document.querySelectorAll("#feature-bullets ul li"))
         .map((li) => (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim())
@@ -522,34 +513,40 @@ async function scrapeProductData(page) {
       return items.length ? items.join("") : "";
     })();
 
+    // -------- Product Description --------
     const productDescription = (() => {
       const el = document.querySelector("#productDescription");
       if (!el) return "";
       return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
     })();
 
+    // -------- Images --------
     const mainImageUrl = (() => {
       const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
       if (imgTag) return imgTag.getAttribute("src") || "";
       return "";
     })();
 
+    // Normalize thumbnail -> base jpg (do not force AC_SL here)
     const normalizeImageUrl = (url) => {
       if (!url) return "";
       return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
     };
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
+    // Collect candidate URLs from visible thumbs
     let additionalImageUrls = Array.from(document.querySelectorAll("#altImages img, .imageThumb img"))
       .map((img) => img.getAttribute("src") || "")
       .map((src) => (src || "").trim())
       .filter(Boolean);
 
+    // Also inspect landing image attributes
     const landing = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
     const fromLandingAttrs = [];
     if (landing) {
       const oldHires = landing.getAttribute("data-old-hires");
       if (oldHires) fromLandingAttrs.push(oldHires);
+
       const dyn = landing.getAttribute("data-a-dynamic-image");
       if (dyn) {
         try {
@@ -569,18 +566,21 @@ async function scrapeProductData(page) {
       }
     }
 
+    additionalImageUrls = [
+      ...additionalImageUrls,
+      ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
+    ];
+
+    // Scan entire document for hi-res URLs ending with ._AC_SL{digits}_.jpg
     const hiResMatches = Array.from(
       document.documentElement.innerHTML.matchAll(
         /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi
       )
     ).map((m) => m[0]);
 
-    additionalImageUrls = [
-      ...additionalImageUrls,
-      ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
-      ...hiResMatches,
-    ];
+    additionalImageUrls = [...new Set([...additionalImageUrls, ...hiResMatches])];
 
+    // Remove obvious junk thumbs/sprites/overlays
     additionalImageUrls = additionalImageUrls.filter((src) => {
       if (!src) return false;
       const lower = src.toLowerCase();
@@ -594,6 +594,7 @@ async function scrapeProductData(page) {
       );
     });
 
+    // Final pass: keep ANY _AC_SL{n}_ size, drop main
     const AC_ANY = /\._AC_SL\d+_\.jpg(?:\?.*)?$/i;
     additionalImageUrls = additionalImageUrls
       .filter((url) => url && url !== normalizedMain)
@@ -613,20 +614,16 @@ async function scrapeProductData(page) {
   }, title);
 }
 
-// --- Gemini OCR (Brand + Price) ---
-function includesCurrency(s = "") {
-  return /[\p{Sc}]|\b[A-Z]{3}\b/u.test(s);
-}
-function currencyToken(s = "") {
-  const m = s.match(/([\p{Sc}]|\b[A-Z]{3}\b)/u);
-  return m ? m[1] : "";
-}
+/**
+ * Gemini OCR extraction (Brand + Price with currency)
+ */
 async function geminiExtract(base64Image) {
   const prompt = `
 You are given a screenshot of an Amazon product page.
 Extract JSON with exactly these keys:
 - brand: string (brand or manufacturer name)
 - price: string (include currency symbol or ISO code, e.g., "$12.99" or "USD 12.99")
+
 Rules:
 - Return ONLY valid minified JSON: {"brand":"...","price":"..."}
 - If a field is unknown or not visible, use "Unspecified".`;
@@ -650,7 +647,36 @@ Rules:
   }
 }
 
-// --- Normalize Gemini price (fix superscripts, missing currency, etc.) ---
+// ---------- endpoints ----------
+app.get("/", (req, res) => {
+  res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
+});
+
+function extractASINFromUrl(u = "") {
+  try {
+    const url = new URL(u);
+    const path = url.pathname;
+    const m1 = path.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = path.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
+  } catch {
+    const m1 = u.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
+  }
+}
+
+function includesCurrency(s = "") {
+  return /[\p{Sc}]|\b[A-Z]{3}\b/u.test(s);
+}
+function currencyToken(s = "") {
+  const m = s.match(/([\p{Sc}]|\b[A-Z]{3}\b)/u);
+  return m ? m[1] : "";
+}
+
+/**
+ * Normalize Gemini price strings (fix superscripts, etc.)
+ */
 function normalizeGeminiPrice(raw = "", domPrice = "") {
   let s = (raw || "").trim();
   if (!s) return "Unspecified";
@@ -658,6 +684,7 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   s = s.replace(/[\u00A0\u2009\u202F]/g, " ");
 
   const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]/.test(s);
+
   const map = {
     "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
     "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
@@ -691,26 +718,6 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   return s || "Unspecified";
 }
 
-// --- Utilities ---
-function extractASINFromUrl(u = "") {
-  try {
-    const url = new URL(u);
-    const path = url.pathname;
-    const m1 = path.match(/\/dp\/([A-Z0-9]{8,10})/i);
-    const m2 = path.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
-    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
-  } catch {
-    const m1 = u.match(/\/dp\/([A-Z0-9]{8,10})/i);
-    const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
-    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
-  }
-}
-
-// --- endpoints ---
-app.get("/", (req, res) => {
-  res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
-});
-
 app.get("/scrape", async (req, res) => {
   const url = req.query.url;
   if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
@@ -724,23 +731,15 @@ app.get("/scrape", async (req, res) => {
     context = ctx.context;
     page = ctx.page;
 
-    // Nav with retries + block detection
-    await safeGoto(page, url, { retries: 2, timeout: 70000 });
+    // Hardened navigation with retry + CAPTCHA detection
+    await safeGoto(page, url, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Handle Amazon "Continue/Keep shopping" and side sheets robustly
+    // Dismiss/handle "Continue/Keep shopping"
     page = await handleContinueShopping(page, context, url);
-
-    // If handler returned a closed/empty page, resurrect once here instead of erroring
-    if (!page || page.isClosed()) {
-      const fresh = await context.newPage();
-      try { await fresh.bringToFront(); } catch {}
-      await safeGoto(fresh, url, { retries: 1, timeout: 70000 });
-      page = fresh;
-    }
     ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
 
-    // Detect product page
+    // Product page or not? (retry if page closed)
     let productLike;
     try {
       productLike = await isProductPage(page);
@@ -749,10 +748,12 @@ app.get("/scrape", async (req, res) => {
         page = await adoptActivePageOrThrow(page, context);
         await sleep(200);
         productLike = await isProductPage(page);
-      } else { throw e; }
+      } else {
+        throw e;
+      }
     }
 
-    // Non-product page: screenshot + links/buttons
+    // If NOT a product page: capture screenshot, extract links/buttons, return.
     if (!productLike) {
       let bufNP;
       try {
@@ -761,7 +762,9 @@ app.get("/scrape", async (req, res) => {
         if (isClosedErr(e)) {
           page = await adoptActivePageOrThrow(page, context);
           bufNP = await safeScreenshot(page, { type: "png" }, 1);
-        } else { throw e; }
+        } else {
+          throw e;
+        }
       }
       const base64NP = bufNP.toString("base64");
       const meta = {
@@ -785,10 +788,10 @@ app.get("/scrape", async (req, res) => {
       });
     }
 
-    // Small settle for above-the-fold
+    // Small pause to stabilize above-the-fold
     await sleep(jitter(300, 400));
 
-    // Scrape Playwright-visible fields
+    // Scrape Playwright data (retry if page closed mid-evaluate)
     let scraped;
     try {
       scraped = await scrapeProductData(page);
@@ -797,12 +800,14 @@ app.get("/scrape", async (req, res) => {
         page = await adoptActivePageOrThrow(page, context);
         await sleep(200);
         scraped = await scrapeProductData(page);
-      } else { throw e; }
+      } else {
+        throw e;
+      }
     }
 
     ensureAlive(page, "Page closed before screenshot");
 
-    // Screenshot for OCR
+    // Screenshot for OCR (with retry + adopt)
     let buf;
     try {
       buf = await safeScreenshot(page, { type: "png" }, 1);
@@ -810,48 +815,60 @@ app.get("/scrape", async (req, res) => {
       if (isClosedErr(e)) {
         page = await adoptActivePageOrThrow(page, context);
         buf = await safeScreenshot(page, { type: "png" }, 1);
-      } else { throw e; }
+      } else {
+        throw e;
+      }
     }
     const base64 = buf.toString("base64");
 
-    // Gemini OCR
+    // Gemini OCR for Brand + Price (with currency)
     const gemini = await geminiExtract(base64);
-    const priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
 
+    // Normalize Gemini price
+    let priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
+
+    // ASIN from final resolved URL
     const resolvedUrl = page.url() || url;
     const asin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(url);
 
-    // Final payload
+    // Final JSON
     res.json({
       ok: true,
       url: resolvedUrl,
       pageType: "product",
       ASIN: asin || "Unspecified",
       title: scraped.title || "Unspecified",
-      brand: gemini.brand || "Unspecified",
-      itemForm: scraped.itemForm || "Unspecified",
-      price: scraped.price || "Unspecified",
-      priceGemini: priceGemini || "Unspecified",
+      brand: gemini.brand || "Unspecified",               // Gemini OCR
+      itemForm: scraped.itemForm || "Unspecified",        // Playwright (new logic)
+      price: scraped.price || "Unspecified",              // Playwright (currency ensured)
+      priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
       featuredBullets: scraped.featuredBullets || "Unspecified",
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
-      screenshot: base64,
+      screenshot: base64,                                  // base64 PNG
     });
   } catch (err) {
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
+    res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
   } finally {
-    // Close all pages to avoid leaks if a popup was opened
+    // Close all pages in context to avoid leaks if a popup was opened
     try {
       for (const p of context?.pages?.() || []) {
-        try { if (!p.isClosed()) await p.close({ runBeforeUnload: false }); } catch {}
+        try {
+          if (!p.isClosed()) await p.close({ runBeforeUnload: false });
+        } catch {}
       }
     } catch {}
-    try { await browser?.close(); } catch {}
+    try {
+      await browser?.close();
+    } catch {}
   }
 });
 
-// --- Start server ---
+// Start server
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Running on port ${PORT}`);
 });
