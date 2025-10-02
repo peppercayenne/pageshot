@@ -1,4 +1,4 @@
- // index.js
+// index.js
 // Express + Playwright + Gemini OCR
 // Scrapes Amazon product info via DOM + Gemini OCR on screenshot
 //
