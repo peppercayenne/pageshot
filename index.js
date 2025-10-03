@@ -8,6 +8,7 @@ import express from "express";
 import cors from "cors";
 import { chromium } from "playwright";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import fs from "fs";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -151,6 +152,91 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
 }
 
 /**
+ * Amazon detour / canonical helpers
+ */
+function isAmazonDetour(u = "") {
+  try {
+    const { pathname } = new URL(u);
+    return (
+      pathname.startsWith("/hz/mobile/mission") ||
+      pathname.startsWith("/hz/hub") ||
+      pathname.startsWith("/ap/signin") ||
+      pathname.startsWith("/ap/register") ||
+      pathname.startsWith("/gp/history") ||
+      pathname.startsWith("/gp/yourstore")
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Some URLs we treat as non-product immediately (e.g., account-only areas)
+function shouldTreatAsNonProductUrl(u = "") {
+  try {
+    const { pathname, host } = new URL(u);
+    if (host && !/amazon\./i.test(host)) return true; // off-domain
+    if (isAmazonDetour(u)) return true;
+    if (pathname.startsWith("/gp/help") || pathname.startsWith("/customer-preferences")) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function extractASINFromUrl(u = "") {
+  try {
+    const url = new URL(u);
+    const path = url.pathname;
+    const m1 = path.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = path.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
+  } catch {
+    const m1 = u.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
+  }
+}
+
+// Loose ASIN finder (fallback to any 10-char A–Z/0–9 token)
+function extractASINLoose(u = "") {
+  const strict = extractASINFromUrl(u);
+  if (strict) return strict;
+  const m = (u || "").match(/\b([A-Z0-9]{10})\b/i);
+  return (m?.[1] || "").toUpperCase();
+}
+
+// Bounce to canonical /dp/ASIN once
+async function bounceToCanonicalOnce(page, originalUrl) {
+  const asin = extractASINLoose(originalUrl) || extractASINLoose(page.url());
+  if (!asin) return false;
+  const canonical = `https://www.amazon.com/dp/${asin}`;
+  try {
+    await page.goto(canonical, { waitUntil: "domcontentloaded", referer: "https://www.amazon.com/" });
+    await page.waitForTimeout(600);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// White-body detector: header visible but no product scaffold/content
+async function looksLikeWhiteBody(page) {
+  try {
+    return await page.evaluate(() => {
+      const hasHeader =
+        !!document.getElementById("navbar") ||
+        !!document.querySelector("#nav-belt, #nav-main, #navFooter");
+      const hasProductScaffold = !!document.querySelector("#dp, #ppd, #centerCol, #leftCol, #productTitle");
+      const bodyText = (document.body?.innerText || "").trim();
+      const bodySmall = document.body?.clientHeight && document.body.clientHeight < 400;
+      return hasHeader && !hasProductScaffold && (bodySmall || bodyText.length < 200);
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Close the "Added to Cart" side sheet if visible
  */
 async function closeAttachSideSheetIfVisible(page) {
@@ -245,8 +331,6 @@ async function clickContinueShoppingIfPresent(page) {
 
 /**
  * Handle "Continue/Keep shopping" and return a guaranteed alive page.
- * If Amazon kills the tab and no replacement appears, open a **new page**
- * and reload the provided fallback URL.
  */
 async function handleContinueShopping(page, context, fallbackUrl) {
   try {
@@ -652,20 +736,6 @@ app.get("/", (req, res) => {
   res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
 });
 
-function extractASINFromUrl(u = "") {
-  try {
-    const url = new URL(u);
-    const path = url.pathname;
-    const m1 = path.match(/\/dp\/([A-Z0-9]{8,10})/i);
-    const m2 = path.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
-    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
-  } catch {
-    const m1 = u.match(/\/dp\/([A-Z0-9]{8,10})/i);
-    const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
-    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
-  }
-}
-
 function includesCurrency(s = "") {
   return /[\p{Sc}]|\b[A-Z]{3}\b/u.test(s);
 }
@@ -731,9 +801,47 @@ app.get("/scrape", async (req, res) => {
     context = ctx.context;
     page = ctx.page;
 
-    // Hardened navigation with retry + CAPTCHA detection
+    // 1) Navigate
     await safeGoto(page, url, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
+
+    // 1a) Detour guard + canonical bounce ASAP
+    if (isAmazonDetour(page.url())) {
+      await bounceToCanonicalOnce(page, url);
+      await sleep(300);
+    }
+
+    // 2) White body hard reload once (if header-only shell)
+    if (await looksLikeWhiteBody(page)) {
+      await page.reload({ waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForLoadState("load").catch(() => {});
+      await sleep(200);
+    }
+
+    // 3) Treat certain URLs as nonProduct immediately
+    if (shouldTreatAsNonProductUrl(page.url())) {
+      let bufNP = await safeScreenshot(page, { type: "png" }, 1);
+      const base64NP = bufNP.toString("base64");
+      const meta = {
+        currentUrl: page.url(),
+        title: (await page.title().catch(() => "")) || "",
+      };
+      const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({
+        links: [],
+        buttons: [],
+        counts: { links: 0, buttons: 0 },
+      }));
+      return res.json({
+        ok: true,
+        url: meta.currentUrl,
+        pageType: "nonProduct",
+        screenshot: base64NP,
+        meta,
+        links,
+        buttons,
+        counts,
+      });
+    }
 
     // Dismiss/handle "Continue/Keep shopping"
     page = await handleContinueShopping(page, context, url);
@@ -827,9 +935,13 @@ app.get("/scrape", async (req, res) => {
     // Normalize Gemini price
     let priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
 
-    // ASIN from final resolved URL
+    // ASIN from final resolved URL or original
     const resolvedUrl = page.url() || url;
-    const asin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(url);
+    const asin =
+      extractASINFromUrl(resolvedUrl) ||
+      extractASINFromUrl(url) ||
+      extractASINLoose(resolvedUrl) ||
+      extractASINLoose(url);
 
     // Final JSON
     res.json({
@@ -839,7 +951,7 @@ app.get("/scrape", async (req, res) => {
       ASIN: asin || "Unspecified",
       title: scraped.title || "Unspecified",
       brand: gemini.brand || "Unspecified",               // Gemini OCR
-      itemForm: scraped.itemForm || "Unspecified",        // Playwright (new logic)
+      itemForm: scraped.itemForm || "Unspecified",        // Playwright
       price: scraped.price || "Unspecified",              // Playwright (currency ensured)
       priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
       featuredBullets: scraped.featuredBullets || "Unspecified",
