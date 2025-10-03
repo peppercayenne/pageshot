@@ -2,7 +2,7 @@
 // Express + Playwright + Gemini OCR
 // Scrapes Amazon product info via DOM + Gemini OCR on screenshot
 //
-// GET /scrape?url=...   (url should be a /dp/<ASIN> link)
+// GET /scrape?url=...
 
 import express from "express";
 import cors from "cors";
@@ -26,12 +26,11 @@ if (!process.env.GEMINI_API_KEY) {
   process.exit(1);
 }
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// Use your preferred model here:
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-/* --------------------------------------
- * Playwright bootstrap
- * ------------------------------------*/
+/**
+ * Minimal Playwright context
+ */
 async function minimalContext(width, height) {
   const browser = await chromium.launch({
     headless: true,
@@ -62,12 +61,13 @@ async function minimalContext(width, height) {
     "accept-language": "en-US,en;q=0.9",
   });
 
+  // Return context so we can adopt new pages/popups later
   return { browser, context, page };
 }
 
-/* --------------------------------------
- * Helpers
- * ------------------------------------*/
+/**
+ * Simple helpers
+ */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
 
@@ -92,36 +92,6 @@ async function adoptActivePageOrThrow(currentPage, context) {
   }
   if (pages[0]) return pages[0];
   throw new Error("All pages are closed");
-}
-
-function extractASINFromUrl(u = "") {
-  try {
-    const url = new URL(u);
-    const path = url.pathname;
-    const m1 = path.match(/\/dp\/([A-Z0-9]{8,10})/i);
-    const m2 = path.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
-    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
-  } catch {
-    const m1 = u.match(/\/dp\/([A-Z0-9]{8,10})/i);
-    const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
-    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
-  }
-}
-
-function sameOriginDpUrl(baseUrl, asin) {
-  // Build an intended /dp/<ASIN> using the same origin as the user-provided URL
-  try {
-    const base = new URL(baseUrl);
-    return `${base.origin}/dp/${asin}`;
-  } catch {
-    return `https://www.amazon.com/dp/${asin}`;
-  }
-}
-
-function isOnIntendedDp(u = "", asin = "") {
-  if (!u || !asin) return false;
-  const re = new RegExp(`/dp/${asin}(?:[/?#]|$)`, "i");
-  return re.test(u);
 }
 
 function isRobotCheckUrl(url) {
@@ -165,6 +135,7 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
       await sleep(jitter(250, 500));
       await page.goto(url, { timeout, waitUntil: "commit" });
       await sleep(jitter(700, 600));
+
       if (await looksBlocked(page)) {
         throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
       }
@@ -209,7 +180,7 @@ async function closeAttachSideSheetIfVisible(page) {
 }
 
 /**
- * Detect & click "Continue/Keep shopping" if present
+ * Detect & click "Continue/Keep shopping" if present (our robust handler)
  */
 async function clickContinueShoppingIfPresent(page) {
   if (await closeAttachSideSheetIfVisible(page)) {
@@ -273,8 +244,48 @@ async function clickContinueShoppingIfPresent(page) {
 }
 
 /**
- * If a side-sheet/overlay kicks us away, try to bring us back.
- * We **also** use this inside the detour recovery loop.
+ * NEW: Ultra-simple fallback requested by user:
+ * If #productTitle is missing, try clicking literal "text=Continue Shopping" up to maxTries.
+ */
+async function hasProductTitle(page) {
+  try {
+    return await page.evaluate(() => {
+      return !!(document.querySelector("#productTitle") || document.querySelector("#title"));
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function trySimpleContinueShoppingFallback(page, maxTries = 3) {
+  for (let i = 0; i < maxTries; i++) {
+    try {
+      // exactly as requested:
+      await page.click("text=Continue Shopping", { timeout: 1500 });
+    } catch {
+      // ignore if not clickable/not found this round
+    }
+
+    // give the click a chance to do something
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "commit", timeout: 4000 }).catch(() => null),
+      page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => null),
+    ]);
+
+    // re-check for product title
+    const ok = await hasProductTitle(page);
+    if (ok) return true;
+
+    // small pause before next try
+    await sleep(350);
+  }
+  return false;
+}
+
+/**
+ * Handle "Continue/Keep shopping" and return a guaranteed alive page.
+ * If Amazon kills the tab and no replacement appears, open a **new page**
+ * and reload the provided fallback URL.
  */
 async function handleContinueShopping(page, context, fallbackUrl) {
   try {
@@ -342,21 +353,29 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
   throw lastErr || new Error("Screenshot failed");
 }
 
-/* --------------------------------------
- * PRODUCT DETECTION & SCRAPING
- * ------------------------------------*/
 /**
- * Very lightweight heuristic (used only for scraping steps – NOT for gating):
- * We still only consider it "product" if URL is /dp/<ASIN>.
+ * Heuristic: are we on a proper Amazon product page?
  */
-async function isProductPageLoosely(page) {
+async function isProductPage(page) {
   try {
     return await page.evaluate(() => {
+      const url = location.href;
+      const canonical = document.querySelector('link[rel="canonical"]')?.href || "";
+      const urlFlag =
+        /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(url) ||
+        /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(canonical);
+
       const hasTitle =
         !!document.querySelector("#productTitle") ||
         !!document.querySelector("#titleSection #title");
-      const layoutHints = !!document.querySelector("#dp, #ppd, #centerCol, #leftCol");
-      return hasTitle || layoutHints;
+      const hasByline = !!document.querySelector("#bylineInfo");
+      const hasBuyCtas =
+        !!document.querySelector("#add-to-cart-button, input#add-to-cart-button") ||
+        !!document.querySelector("#buy-now-button, input#buy-now-button");
+
+      const layoutHints = !!document.querySelector("#dp, #dp-container, #ppd, #centerCol, #leftCol");
+
+      return (urlFlag && hasTitle && layoutHints) || ((hasTitle || hasByline) && hasBuyCtas);
     });
   } catch {
     return false;
@@ -364,7 +383,90 @@ async function isProductPageLoosely(page) {
 }
 
 /**
- * Scrape product data from DOM (Brand is NOT scraped here)
+ * Extract all <a> and button-like elements (used on non-product pages)
+ */
+async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
+  return await page.evaluate((limits) => {
+    const toAbs = (u) => {
+      try {
+        return u ? new URL(u, location.href).href : "";
+      } catch {
+        return u || "";
+      }
+    };
+    const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+    const linkNodes = Array.from(document.querySelectorAll("a"));
+    const btnNodes = Array.from(
+      document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]')
+    );
+
+    const links = linkNodes.slice(0, limits.maxLinks).map((el) => ({
+      tag: "a",
+      text: clean(el.innerText || el.textContent || ""),
+      href: toAbs(el.getAttribute("href")),
+      id: el.id || "",
+      classes: clean(el.className || ""),
+      rel: el.getAttribute("rel") || "",
+      target: el.getAttribute("target") || "",
+      role: el.getAttribute("role") || "",
+      ariaLabel: el.getAttribute("aria-label") || "",
+      onclick: el.getAttribute("onclick") || "",
+    }));
+
+    const buttons = btnNodes.slice(0, limits.maxButtons).map((el) => {
+      const tag = (el.tagName || "").toLowerCase();
+      return {
+        tag,
+        text: clean(el.innerText || el.value || el.textContent || ""),
+        id: el.id || "",
+        classes: clean(el.className || ""),
+        name: el.getAttribute("name") || "",
+        type: el.getAttribute("type") || "",
+        role: el.getAttribute("role") || "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        onclick: el.getAttribute("onclick") || "",
+        href:
+          tag === "a"
+            ? toAbs(el.getAttribute("href"))
+            : el.getAttribute("href")
+            ? toAbs(el.getAttribute("href"))
+            : "",
+      };
+    });
+
+    // Simple de-dupe
+    const seenL = new Set();
+    const dedupLinks = [];
+    for (const l of links) {
+      const k = `${l.href}|${l.text}`;
+      if (l.href && !seenL.has(k)) {
+        seenL.add(k);
+        dedupLinks.push(l);
+      }
+    }
+
+    const seenB = new Set();
+    const dedupButtons = [];
+    for (const b of buttons) {
+      const k = `${b.text}|${b.id}`;
+      if (!seenB.has(k)) {
+        seenB.add(k);
+        dedupButtons.push(b);
+      }
+    }
+
+    return {
+      links: dedupLinks,
+      buttons: dedupButtons,
+      counts: { links: links.length, buttons: buttons.length },
+    };
+  }, limits);
+}
+
+/**
+ * Scrape product data from DOM (Playwright-only fields)
+ * NOTE: Brand is NOT scraped here (Gemini OCR handles brand).
  */
 async function scrapeProductData(page) {
   const title =
@@ -584,232 +686,25 @@ Rules:
   }
 }
 
-/* --------------------------------------
- * DETOUR RECOVERY (your requested logic)
- * ------------------------------------*/
-/**
- * Force staying on the intended /dp/<ASIN> URL.
- * If current URL deviates (nonProduct), record it and jump back up to maxJumps times.
- * Returns { onDp, page, nonProductUrls, nonProductCount }
- */
-async function ensureIntendedDp(page, context, intendedDpUrl, asin, { maxJumps = 3 } = {}) {
-  const nonProductUrls = [];
-  const seen = new Set();
-
-  const recordDetour = (u) => {
-    if (!u) return;
-    if (!seen.has(u)) {
-      seen.add(u);
-      nonProductUrls.push(u);
-    }
-  };
-
-  let jumps = 0;
-
-  while (true) {
-    ensureAlive(page);
-    // Handle side-sheet flows that may keep us off the PDP
-    page = await handleContinueShopping(page, context, intendedDpUrl);
-
-    const cur = page.url();
-    if (isOnIntendedDp(cur, asin)) {
-      return { onDp: true, page, nonProductUrls, nonProductCount: nonProductUrls.length };
-    }
-
-    // Any non-/dp/<ASIN> URL is a detour
-    recordDetour(cur);
-
-    if (jumps >= maxJumps) {
-      return { onDp: false, page, nonProductUrls, nonProductCount: nonProductUrls.length };
-    }
-
-    // Jump back to intended DP
-    try {
-      await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
-    } catch (e) {
-      if (isClosedErr(e)) {
-        page = await adoptActivePageOrThrow(page, context);
-        await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
-      } else {
-        throw e;
-      }
-    }
-    jumps++;
-    await sleep(200);
-  }
-}
-
-/* --------------------------------------
- * HTTP endpoints
- * ------------------------------------*/
+// ---------- endpoints ----------
 app.get("/", (req, res) => {
   res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
 });
 
-app.get("/scrape", async (req, res) => {
-  const url = req.query.url;
-  if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
-
-  const width = 1280, height = 800;
-  const asinFromRequest = extractASINFromUrl(url);
-  const intendedDpUrl = asinFromRequest ? sameOriginDpUrl(url, asinFromRequest) : "";
-
-  let browser, context, page;
-  let detourDiag = { nonProductUrls: [], nonProductCount: 0 };
-
+function extractASINFromUrl(u = "") {
   try {
-    const ctx = await minimalContext(width, height);
-    browser = ctx.browser;
-    context = ctx.context;
-    page = ctx.page;
-
-    // 1) Navigate to the requested URL (priority)
-    await safeGoto(page, url, { retries: 2, timeout: 60000 });
-    ensureAlive(page, "Page unexpectedly closed after navigation");
-
-    // 2) If it’s not /dp/<ASIN>, treat as detour and force back to intended DP (up to 3 jumps)
-    if (asinFromRequest) {
-      const startUrl = page.url();
-      if (!isOnIntendedDp(startUrl, asinFromRequest)) {
-        const det = await ensureIntendedDp(page, context, intendedDpUrl, asinFromRequest, { maxJumps: 3 });
-        detourDiag = { nonProductUrls: det.nonProductUrls, nonProductCount: det.nonProductCount };
-        page = det.page;
-        if (!det.onDp) {
-          // Couldn’t get back to intended DP → return nonProduct with diagnostics
-          let bufNP;
-          try {
-            bufNP = await safeScreenshot(page, { type: "png" }, 1);
-          } catch (e) {
-            if (isClosedErr(e)) {
-              page = await adoptActivePageOrThrow(page, context);
-              bufNP = await safeScreenshot(page, { type: "png" }, 1);
-            } else {
-              throw e;
-            }
-          }
-          const base64NP = bufNP.toString("base64");
-          const meta = {
-            currentUrl: page.url(),
-            title: (await page.title().catch(() => "")) || "",
-            intendedDpUrl,
-            asinFromRequest,
-          };
-          return res.json({
-            ok: true,
-            url: meta.currentUrl,
-            pageType: "nonProduct",
-            meta,
-            nonProductCount: detourDiag.nonProductCount,
-            nonProductUrls: detourDiag.nonProductUrls,
-            screenshot: base64NP,
-          });
-        }
-      }
-    } else {
-      // No ASIN present in the request → we cannot enforce DP. Treat as nonProduct immediately.
-      let bufNP = await safeScreenshot(page, { type: "png" }, 1).catch(() => null);
-      const base64NP = bufNP ? bufNP.toString("base64") : "";
-      const meta = {
-        currentUrl: page.url(),
-        title: (await page.title().catch(() => "")) || "",
-        intendedDpUrl: "",
-        asinFromRequest: "",
-      };
-      return res.json({
-        ok: true,
-        url: meta.currentUrl,
-        pageType: "nonProduct",
-        meta,
-        nonProductCount: 1,
-        nonProductUrls: [page.url()],
-        screenshot: base64NP,
-      });
-    }
-
-    // We are now on /dp/<ASIN> (by design) — proceed to scrape
-    await sleep(jitter(300, 400));
-
-    // Scrape Playwright data
-    let scraped;
-    try {
-      scraped = await scrapeProductData(page);
-    } catch (e) {
-      if (isClosedErr(e)) {
-        page = await adoptActivePageOrThrow(page, context);
-        await sleep(200);
-        scraped = await scrapeProductData(page);
-      } else {
-        throw e;
-      }
-    }
-
-    ensureAlive(page, "Page closed before screenshot");
-
-    // Screenshot for OCR
-    let buf;
-    try {
-      buf = await safeScreenshot(page, { type: "png" }, 1);
-    } catch (e) {
-      if (isClosedErr(e)) {
-        page = await adoptActivePageOrThrow(page, context);
-        buf = await safeScreenshot(page, { type: "png" }, 1);
-      } else {
-        throw e;
-      }
-    }
-    const base64 = buf.toString("base64");
-
-    // Gemini OCR (Brand + Price) + normalize Gemini price
-    const gemini = await geminiExtract(base64);
-    const priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
-
-    // Final URL/ASIN
-    const resolvedUrl = page.url() || url;
-    const asin = extractASINFromUrl(resolvedUrl) || asinFromRequest || "Unspecified";
-
-    // Return product JSON (+ detour diagnostics at the end, as requested)
-    res.json({
-      ok: true,
-      url: resolvedUrl,
-      pageType: "product",
-      ASIN: asin || "Unspecified",
-      title: scraped.title || "Unspecified",
-      brand: gemini.brand || "Unspecified",
-      itemForm: scraped.itemForm || "Unspecified",
-      price: scraped.price || "Unspecified",
-      priceGemini: priceGemini || "Unspecified",
-      featuredBullets: scraped.featuredBullets || "Unspecified",
-      productDescription: scraped.productDescription || "Unspecified",
-      mainImageUrl: scraped.mainImageUrl || "Unspecified",
-      additionalImageUrls: scraped.additionalImageUrls || [],
-      // Diagnostics (always present; you asked to include counters/links at the end)
-      nonProductCount: detourDiag.nonProductCount,
-      nonProductUrls: detourDiag.nonProductUrls,
-      screenshot: base64, // keep screenshot in all cases (useful UI preview & OCR source)
-    });
-  } catch (err) {
-    res.status(500).json({
-      ok: false,
-      error: err?.message || String(err),
-    });
-  } finally {
-    // Close all pages in context to avoid leaks if a popup was opened
-    try {
-      for (const p of context?.pages?.() || []) {
-        try {
-          if (!p.isClosed()) await p.close({ runBeforeUnload: false });
-        } catch {}
-      }
-    } catch {}
-    try {
-      await browser?.close();
-    } catch {}
+    const url = new URL(u);
+    const path = url.pathname;
+    const m1 = path.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = path.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
+  } catch {
+    const m1 = u.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
   }
-});
+}
 
-/* --------------------------------------
- * Price normalization (Gemini)
- * ------------------------------------*/
 function includesCurrency(s = "") {
   return /[\p{Sc}]|\b[A-Z]{3}\b/u.test(s);
 }
@@ -817,6 +712,10 @@ function currencyToken(s = "") {
   const m = s.match(/([\p{Sc}]|\b[A-Z]{3}\b)/u);
   return m ? m[1] : "";
 }
+
+/**
+ * Normalize Gemini price strings (fix superscripts, etc.)
+ */
 function normalizeGeminiPrice(raw = "", domPrice = "") {
   let s = (raw || "").trim();
   if (!s) return "Unspecified";
@@ -857,6 +756,164 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   s = s.replace(/\s+/g, " ").trim();
   return s || "Unspecified";
 }
+
+app.get("/scrape", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
+
+  const width = 1280, height = 800;
+
+  let browser, context, page;
+  try {
+    const ctx = await minimalContext(width, height);
+    browser = ctx.browser;
+    context = ctx.context;
+    page = ctx.page;
+
+    // Hardened navigation with retry + CAPTCHA detection
+    await safeGoto(page, url, { retries: 2, timeout: 60000 });
+    ensureAlive(page, "Page unexpectedly closed after navigation");
+
+    // Dismiss/handle "Continue/Keep shopping"
+    page = await handleContinueShopping(page, context, url);
+    ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
+
+    // 👇 NEW: If we don't see #productTitle yet, try the user-requested fallback click up to 3 times.
+    const titlePresent = await hasProductTitle(page);
+    if (!titlePresent) {
+      try {
+        await trySimpleContinueShoppingFallback(page, 3);
+      } catch {}
+    }
+
+    // Product page or not? (retry if page closed)
+    let productLike;
+    try {
+      productLike = await isProductPage(page);
+    } catch (e) {
+      if (isClosedErr(e)) {
+        page = await adoptActivePageOrThrow(page, context);
+        await sleep(200);
+        productLike = await isProductPage(page);
+      } else {
+        throw e;
+      }
+    }
+
+    // If NOT a product page: capture screenshot, extract links/buttons, return.
+    if (!productLike) {
+      let bufNP;
+      try {
+        bufNP = await safeScreenshot(page, { type: "png" }, 1);
+      } catch (e) {
+        if (isClosedErr(e)) {
+          page = await adoptActivePageOrThrow(page, context);
+          bufNP = await safeScreenshot(page, { type: "png" }, 1);
+        } else {
+          throw e;
+        }
+      }
+      const base64NP = bufNP.toString("base64");
+      const meta = {
+        currentUrl: page.url(),
+        title: (await page.title().catch(() => "")) || "",
+      };
+      const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({
+        links: [],
+        buttons: [],
+        counts: { links: 0, buttons: 0 },
+      }));
+      return res.json({
+        ok: true,
+        url: meta.currentUrl,
+        pageType: "nonProduct",
+        screenshot: base64NP,
+        meta,
+        links,
+        buttons,
+        counts,
+      });
+    }
+
+    // Small pause to stabilize above-the-fold
+    await sleep(jitter(300, 400));
+
+    // Scrape Playwright data (retry if page closed mid-evaluate)
+    let scraped;
+    try {
+      scraped = await scrapeProductData(page);
+    } catch (e) {
+      if (isClosedErr(e)) {
+        page = await adoptActivePageOrThrow(page, context);
+        await sleep(200);
+        scraped = await scrapeProductData(page);
+      } else {
+        throw e;
+      }
+    }
+
+    ensureAlive(page, "Page closed before screenshot");
+
+    // Screenshot for OCR (with retry + adopt)
+    let buf;
+    try {
+      buf = await safeScreenshot(page, { type: "png" }, 1);
+    } catch (e) {
+      if (isClosedErr(e)) {
+        page = await adoptActivePageOrThrow(page, context);
+        buf = await safeScreenshot(page, { type: "png" }, 1);
+      } else {
+        throw e;
+      }
+    }
+    const base64 = buf.toString("base64");
+
+    // Gemini OCR for Brand + Price (with currency)
+    const gemini = await geminiExtract(base64);
+
+    // Normalize Gemini price
+    let priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
+
+    // ASIN from final resolved URL
+    const resolvedUrl = page.url() || url;
+    const asin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(url);
+
+    // Final JSON
+    res.json({
+      ok: true,
+      url: resolvedUrl,
+      pageType: "product",
+      ASIN: asin || "Unspecified",
+      title: scraped.title || "Unspecified",
+      brand: gemini.brand || "Unspecified",               // Gemini OCR
+      itemForm: scraped.itemForm || "Unspecified",        // Playwright (new logic)
+      price: scraped.price || "Unspecified",              // Playwright (currency ensured)
+      priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
+      featuredBullets: scraped.featuredBullets || "Unspecified",
+      productDescription: scraped.productDescription || "Unspecified",
+      mainImageUrl: scraped.mainImageUrl || "Unspecified",
+      additionalImageUrls: scraped.additionalImageUrls || [],
+      screenshot: base64,                                  // base64 PNG
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
+  } finally {
+    // Close all pages in context to avoid leaks if a popup was opened
+    try {
+      for (const p of context?.pages?.() || []) {
+        try {
+          if (!p.isClosed()) await p.close({ runBeforeUnload: false });
+        } catch {}
+      }
+    } catch {}
+    try {
+      await browser?.close();
+    } catch {}
+  }
+});
 
 // Start server
 app.listen(PORT, "0.0.0.0", () => {
