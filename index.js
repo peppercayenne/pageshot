@@ -132,36 +132,51 @@ function isLikelyDetourUrl(u = "") {
   );
 }
 
-// NEW helpers for frame-aware overlay handling
-function likelyAttachFrame(f) {
-  const name = (f.name() || "");
-  const url = (f.url() || "");
-  return /attach|sidesheet|hlb|add-to-cart|upsell/i.test(name) || /attach|sidesheet|hlb|add-to-cart|upsell/i.test(url);
-}
-function getAttachFrames(page) {
-  return page.frames().filter(likelyAttachFrame);
-}
-async function waitForOverlayToSettleOrTitle(page, timeout = 7000) {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    try {
-      const overlayGone = await page.evaluate(() => {
-        const q = (s) => document.querySelector(s);
-        return !(
-          q("#attach-close_sideSheet-link") ||
-          q("#attachAccessoryView") ||
-          q("#attach-desktop-sideSheet") ||
-          q('iframe[name*="attach"], iframe#attachSideSheet, iframe#attach-sidesheet-frame')
-        );
-      }).catch(() => false);
-
-      const titleBack = await hasProductTitle(page).catch(() => false);
-
-      if (overlayGone || titleBack) return true;
-    } catch {}
-    await sleep(150);
+/* --------------------- Overlay suppression (1: network+CSS) --------------- */
+async function installAttachBlockers(context, page) {
+  if (!context._attachBlockersInstalled) {
+    const patterns = [
+      /https:\/\/[^/]*amazon\.[^/]+\/hz\/attach/i,     // attach side-sheet endpoints
+      /https:\/\/[^/]*amazon\.[^/]+\/gp\/huc\//i,      // HUC overlay
+      /https:\/\/[^/]*amazon\.[^/]+\/.*attach.*sheet/i // extra conservative
+    ];
+    for (const re of patterns) {
+      await context.route(re, (r) => r.abort()).catch(() => {});
+    }
+    context._attachBlockersInstalled = true;
   }
-  return false;
+
+  // CSS/DOM kill-switch to remove any overlay that still sneaks in
+  await page.addInitScript(() => {
+    const kill = () => {
+      const sels = [
+        '#attach-desktop-sideSheet',
+        '#attachAccessoryView',
+        'iframe[name*="attach"]',
+        'iframe#attachSideSheet',
+        'iframe#attach-sidesheet-frame'
+      ];
+      for (const sel of sels) document.querySelectorAll(sel).forEach((el) => el.remove());
+      let style = document.getElementById('__attach_kill__');
+      if (!style) {
+        style = document.createElement('style');
+        style.id = '__attach_kill__';
+        document.head.appendChild(style);
+      }
+      style.textContent = `
+        #attach-desktop-sideSheet, #attachAccessoryView,
+        iframe[name*="attach"], iframe#attachSideSheet, iframe#attach-sidesheet-frame {
+          display: none !important;
+          visibility: hidden !important;
+          opacity: 0 !important;
+          pointer-events: none !important;
+        }`;
+    };
+    kill();
+    new MutationObserver(kill).observe(document.documentElement, { childList: true, subtree: true });
+    window.addEventListener('load', kill, { once: true });
+    document.addEventListener('DOMContentLoaded', kill, { once: true });
+  });
 }
 
 /* ---------------------------- Navigation helpers -------------------------- */
@@ -221,14 +236,59 @@ async function hasProductTitle(page) {
   }
 }
 
+/* ------------------ Attach/HLB detection & settle helpers ----------------- */
+function likelyAttachFrame(f) {
+  const name = (f.name() || "");
+  const url = (f.url() || "");
+  return /attach|sidesheet|hlb|add-to-cart|upsell/i.test(name) || /attach|sidesheet|hlb|add-to-cart|upsell/i.test(url);
+}
+function getAttachFrames(page) {
+  return page.frames().filter(likelyAttachFrame);
+}
+async function isAttachOverlayVisible(page) {
+  try {
+    return await page.evaluate(() => {
+      if (document.querySelector('#attach-desktop-sideSheet') ||
+          document.querySelector('#attachAccessoryView')) return true;
+      const iframes = Array.from(document.querySelectorAll('iframe'));
+      return iframes.some(f =>
+        /attach|sidesheet|hlb|add-to-cart|upsell/i.test(f.name || '') ||
+        /attach|sidesheet|hlb|add-to-cart|upsell/i.test(f.src || '')
+      );
+    });
+  } catch { return false; }
+}
+async function waitForOverlayToSettleOrTitle(page, timeout = 7000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    try {
+      const overlayGone = !(await isAttachOverlayVisible(page));
+      const titleBack   = await hasProductTitle(page).catch(() => false);
+      if (overlayGone || titleBack) return true;
+    } catch {}
+    await sleep(150);
+  }
+  return false;
+}
+// Give product DOM a chance to appear before we classify detours
+async function waitProductMarkers(page, ms = 3500) {
+  try {
+    await page.waitForSelector('#productTitle, #titleSection #title, #dp, #ppd', { timeout: ms });
+  } catch {}
+}
+
 /* ---------------- Improved Continue Shopping logic (frame-aware) ---------- */
-// Click “Continue/Keep shopping” if present — calls onClick() when we actually click.
+// Count dismissals, not retries: onClick() is only fired if overlay was visible and now gone.
 async function clickContinueShoppingIfPresent(page, onClick) {
-  // 1) explicit close in main frame
-  if (await closeAttachSideSheetIfVisible(page)) {
-    onClick?.();
-    await waitForOverlayToSettleOrTitle(page, 5000);
-    return true;
+  // explicit close in main frame
+  {
+    const was = await isAttachOverlayVisible(page);
+    if (await closeAttachSideSheetIfVisible(page)) {
+      await waitForOverlayToSettleOrTitle(page, 5000);
+      const now = await isAttachOverlayVisible(page);
+      if (was && !now) onClick?.();
+      return true;
+    }
   }
 
   // candidates in main frame
@@ -258,10 +318,12 @@ async function clickContinueShoppingIfPresent(page, onClick) {
   const tryClick = async (loc) => {
     try {
       if (await loc.isVisible({ timeout: 400 }).catch(() => false)) {
+        const was = await isAttachOverlayVisible(page);
         try { await loc.scrollIntoViewIfNeeded({ timeout: 500 }); } catch {}
         await loc.click({ timeout: 1500 }).catch(() => {});
-        onClick?.();
         await waitForOverlayToSettleOrTitle(page, 5000);
+        const now = await isAttachOverlayVisible(page);
+        if (was && !now) onClick?.();
         return true;
       }
     } catch {}
@@ -272,49 +334,61 @@ async function clickContinueShoppingIfPresent(page, onClick) {
     if (await tryClick(loc)) return true;
   }
 
-  // Soft fallback: Esc can dismiss side-sheet
-  try { await page.keyboard.press('Escape'); } catch {}
-  if (await waitForOverlayToSettleOrTitle(page, 2500)) {
-    onClick?.();
-    return true;
+  // Soft fallback: Esc to dismiss side-sheet
+  {
+    const was = await isAttachOverlayVisible(page);
+    try { await page.keyboard.press('Escape'); } catch {}
+    await waitForOverlayToSettleOrTitle(page, 2500);
+    const now = await isAttachOverlayVisible(page);
+    if (was && !now) {
+      onClick?.();
+      return true;
+    }
   }
 
   return false;
 }
 
-// EXACT request: click literal "Continue/Keep shopping" up to maxTries; on each success, onClick()
+// EXACT request: tries up to maxTries rounds; each round one click attempt then settle
 async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
   for (let i = 0; i < maxTries; i++) {
-    let clicked = false;
+    let attempted = false;
 
-    const t = page.getByText(/continue shopping|keep shopping/i).first();
-    if (await t.isVisible({ timeout: 600 }).catch(() => false)) {
-      await t.click({ timeout: 1500 }).catch(() => {});
-      clicked = true;
-      onClick?.();
+    const attemptTextClick = async (scope) => {
+      const t = scope.getByText(/continue shopping|keep shopping/i).first();
+      if (await t.isVisible({ timeout: 600 }).catch(() => false)) {
+        const was = await isAttachOverlayVisible(page);
+        await t.click({ timeout: 1500 }).catch(() => {});
+        attempted = true;
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: "commit", timeout: 3000 }).catch(() => null),
+          page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => null),
+          waitForOverlayToSettleOrTitle(page, 3000),
+        ]);
+        const now = await isAttachOverlayVisible(page);
+        if (was && !now) onClick?.();
+        return true;
+      }
+      return false;
+    };
+
+    if (await attemptTextClick(page)) {
+      if (await hasProductTitle(page)) return true;
     } else {
       for (const f of getAttachFrames(page)) {
-        const ft = f.getByText(/continue shopping|keep shopping/i).first();
-        if (await ft.isVisible({ timeout: 400 }).catch(() => false)) {
-          await ft.click({ timeout: 1500 }).catch(() => {});
-          clicked = true;
-          onClick?.();
-          break;
-        }
+        if (await attemptTextClick(f)) break;
       }
     }
 
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: "commit", timeout: 3000 }).catch(() => null),
-      page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => null),
-      waitForOverlayToSettleOrTitle(page, 3000),
-    ]);
-
     if (await hasProductTitle(page)) return true;
 
-    if (!clicked) {
+    // Try Esc between attempts (no increment unless it truly dismisses)
+    const was = await isAttachOverlayVisible(page);
+    if (!attempted) {
       try { await page.keyboard.press('Escape'); } catch {}
       await sleep(300);
+      const now = await isAttachOverlayVisible(page);
+      if (was && !now) onClick?.();
     }
   }
   return false;
@@ -602,6 +676,9 @@ app.get("/scrape", async (req, res) => {
     context = ctx.context;
     page = ctx.page;
 
+    // (1) Install attach/HLB blockers BEFORE first navigation
+    await installAttachBlockers(context, page);
+
     // First nav: go to the given URL
     await safeGoto(page, inputUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
@@ -611,10 +688,19 @@ app.get("/scrape", async (req, res) => {
       if (!intendedDpUrl) return;
       for (let i = 0; i < 3; i++) {
         const curUrl = page.url();
-        if (isDpUrl(curUrl)) break;
+
+        // (2) Reduce false positives: wait briefly for product markers
+        await waitProductMarkers(page, 3500);
+        const productish = await isProductPage(page);
+
+        if (productish || isDpUrl(curUrl)) break;
+
         if (isLikelyDetourUrl(curUrl) || !isDpUrl(curUrl)) {
-          nonProductCount++;
-          nonProductUrls.push(curUrl);
+          // only count/log non-dp URLs as detours
+          if (!isDpUrl(curUrl)) {
+            nonProductCount++;
+            nonProductUrls.push(curUrl);
+          }
           await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
           await handleContinueShopping(page, context, intendedDpUrl, () => continueShoppingClicks++);
           if (!(await hasProductTitle(page))) {
@@ -637,8 +723,12 @@ app.get("/scrape", async (req, res) => {
 
     // If we're still not on a product page and know ASIN, one final bounce-to-dp
     if (!productLike && intendedDpUrl) {
-      nonProductCount++;
-      nonProductUrls.push(page.url());
+      const u = page.url();
+      await waitProductMarkers(page, 3500);
+      if (!isDpUrl(u)) {
+        nonProductCount++;
+        nonProductUrls.push(u);
+      }
       await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
       await handleContinueShopping(page, context, intendedDpUrl, () => continueShoppingClicks++);
       if (!(await hasProductTitle(page))) {
