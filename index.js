@@ -562,9 +562,7 @@ async function scrapeProductData(page) {
     (await page.textContent("#title").catch(() => null));
 
   return await page.evaluate((title) => {
-    // -------- Item Form (prefer Product Overview row .po-item_form) --------
     const itemForm = (() => {
-      // 1) Primary: <tr class="... po-item_form ..."> → value in 2nd <td>
       const row =
         document.querySelector("tr.po-item_form") ||
         document.querySelector('tr[class*="po-item_form"]');
@@ -577,7 +575,6 @@ async function scrapeProductData(page) {
           if (text) return text;
         }
       }
-      // 2) Any row where first <td> label contains "Item Form"
       const altRow = Array.from(document.querySelectorAll("tr")).find((tr) => {
         const firstTd = tr.querySelector("td");
         if (!firstTd) return false;
@@ -593,7 +590,6 @@ async function scrapeProductData(page) {
           if (text) return text;
         }
       }
-      // 3) Fallback: bullet or list: "Item Form: Lotion"
       const li = Array.from(
         document.querySelectorAll("#detailBullets_feature_div li, li")
       ).find((el) => /item\s*form/i.test(el.innerText || el.textContent || ""));
@@ -607,7 +603,6 @@ async function scrapeProductData(page) {
       return "";
     })();
 
-    // -------- Price (ensure currency) --------
     const getPriceWithCurrency = () => {
       const priceEl =
         document.querySelector(".a-price .a-offscreen") ||
@@ -631,7 +626,6 @@ async function scrapeProductData(page) {
     };
     const price = getPriceWithCurrency();
 
-    // -------- Featured bullets (each item prefixed with "• " and suffixed with " ") --------
     const featuredBullets = (() => {
       const items = Array.from(document.querySelectorAll("#feature-bullets ul li"))
         .map((li) => (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim())
@@ -640,34 +634,29 @@ async function scrapeProductData(page) {
       return items.length ? items.join("") : "";
     })();
 
-    // -------- Product Description --------
     const productDescription = (() => {
       const el = document.querySelector("#productDescription");
       if (!el) return "";
       return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
     })();
 
-    // -------- Images --------
     const mainImageUrl = (() => {
       const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
       if (imgTag) return imgTag.getAttribute("src") || "";
       return "";
     })();
 
-    // Normalize thumbnail -> base jpg (do not force AC_SL here)
     const normalizeImageUrl = (url) => {
       if (!url) return "";
       return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
     };
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
-    // Collect candidate URLs from visible thumbs
     let additionalImageUrls = Array.from(document.querySelectorAll("#altImages img, .imageThumb img"))
       .map((img) => img.getAttribute("src") || "")
       .map((src) => (src || "").trim())
       .filter(Boolean);
 
-    // Also inspect landing image attributes
     const landing = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
     const fromLandingAttrs = [];
     if (landing) {
@@ -698,7 +687,6 @@ async function scrapeProductData(page) {
       ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
     ];
 
-    // Scan entire document for hi-res URLs ending with ._AC_SL{digits}_.jpg
     const hiResMatches = Array.from(
       document.documentElement.innerHTML.matchAll(
         /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi
@@ -707,7 +695,6 @@ async function scrapeProductData(page) {
 
     additionalImageUrls = [...new Set([...additionalImageUrls, ...hiResMatches])];
 
-    // Remove obvious junk thumbs/sprites/overlays
     additionalImageUrls = additionalImageUrls.filter((src) => {
       if (!src) return false;
       const lower = src.toLowerCase();
@@ -721,7 +708,6 @@ async function scrapeProductData(page) {
       );
     });
 
-    // Final pass: keep ANY _AC_SL{n}_ size, drop main
     const AC_ANY = /\._AC_SL\d+_\.jpg(?:\?.*)?$/i;
     additionalImageUrls = additionalImageUrls
       .filter((url) => url && url !== normalizedMain)
@@ -748,10 +734,13 @@ app.get("/scrape", async (req, res) => {
 
   const width = 1280, height = 800;
 
-  // Choose a "target" product URL: prefer canonical /dp/ASIN if we can extract it;
-  // otherwise fall back to the original URL.
+  // Prefer canonical /dp/ASIN if present; otherwise use the original URL as target.
   const asin = extractASINFromUrl(originalUrl);
   const targetUrl = buildDpUrl(asin) || originalUrl;
+
+  // NEW: configurable bounces + counter
+  const MAX_BOUNCES = 1; // current behavior = one bounce attempt
+  let detourBounceAttempts = 0;
 
   let browser, context, page;
   try {
@@ -768,20 +757,18 @@ app.get("/scrape", async (req, res) => {
     page = await handleContinueShopping(page, context, targetUrl);
     ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
 
-    // 2) If redirected to a detour (ANY non-product URL), bounce back ONCE to targetUrl
-    const cur1 = page.url();
-    const onDetour1 = !isProductUrl(cur1) || isLikelyDetourUrl(cur1);
-    if (onDetour1) {
+    // 2) If on detour (ANY non-product URL), try up to MAX_BOUNCES to jump back to targetUrl
+    let currentUrl = page.url();
+    while ((!isProductUrl(currentUrl) || isLikelyDetourUrl(currentUrl)) && detourBounceAttempts < MAX_BOUNCES) {
+      detourBounceAttempts++;
       await safeGoto(page, targetUrl, { retries: 1, timeout: 60000 });
       page = await handleContinueShopping(page, context, targetUrl);
-      ensureAlive(page, "Page closed after single bounce back");
+      ensureAlive(page, "Page closed after bounce back");
+      currentUrl = page.url();
     }
 
-    // 3) After the single bounce, if we're STILL on a detour, return nonProduct JSON immediately
-    const cur2 = page.url();
-    const stillDetour = !isProductUrl(cur2) || isLikelyDetourUrl(cur2);
-    if (stillDetour) {
-      // capture screenshot + some helpful metadata and bail
+    // 3) After the bounces, if we're STILL on a detour, return nonProduct JSON immediately
+    if (!isProductUrl(currentUrl) || isLikelyDetourUrl(currentUrl)) {
       let bufNP;
       try {
         bufNP = await safeScreenshot(page, { type: "png" }, 1);
@@ -795,11 +782,13 @@ app.get("/scrape", async (req, res) => {
       }
       const base64NP = bufNP.toString("base64");
       const meta = {
-        currentUrl: cur2,
+        currentUrl,
         title: (await page.title().catch(() => "")) || "",
-        bouncedOnce: true,
         originalUrl,
         targetUrl,
+        // expose attempts in meta too (handy for inspection)
+        detourBounceAttempts,
+        maxBounces: MAX_BOUNCES,
       };
       const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({
         links: [],
@@ -808,8 +797,9 @@ app.get("/scrape", async (req, res) => {
       }));
       return res.json({
         ok: true,
-        url: cur2,
+        url: currentUrl,
         pageType: "nonProduct",
+        detourBounceAttempts, // NEW top-level stat
         screenshot: base64NP,
         meta,
         links,
@@ -849,9 +839,10 @@ app.get("/scrape", async (req, res) => {
       const meta = {
         currentUrl: page.url(),
         title: (await page.title().catch(() => "")) || "",
-        bouncedOnce: onDetour1,
         originalUrl,
         targetUrl,
+        detourBounceAttempts,
+        maxBounces: MAX_BOUNCES,
       };
       const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({
         links: [],
@@ -862,6 +853,7 @@ app.get("/scrape", async (req, res) => {
         ok: true,
         url: meta.currentUrl,
         pageType: "nonProduct",
+        detourBounceAttempts, // NEW
         screenshot: base64NP,
         meta,
         links,
@@ -913,22 +905,23 @@ app.get("/scrape", async (req, res) => {
     const resolvedUrl = page.url() || originalUrl;
     const asinResolved = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(originalUrl);
 
-    // Final JSON
+    // Final JSON (now includes detourBounceAttempts)
     res.json({
       ok: true,
       url: resolvedUrl,
       pageType: "product",
+      detourBounceAttempts, // NEW top-level stat
       ASIN: asinResolved || "Unspecified",
       title: scraped.title || "Unspecified",
-      brand: gemini.brand || "Unspecified",               // Gemini OCR
-      itemForm: scraped.itemForm || "Unspecified",        // Playwright
-      price: scraped.price || "Unspecified",              // Playwright
-      priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
+      brand: gemini.brand || "Unspecified",
+      itemForm: scraped.itemForm || "Unspecified",
+      price: scraped.price || "Unspecified",
+      priceGemini: priceGemini || "Unspecified",
       featuredBullets: scraped.featuredBullets || "Unspecified",
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
-      screenshot: base64,                                  // base64 PNG
+      screenshot: base64,
     });
   } catch (err) {
     res.status(500).json({
