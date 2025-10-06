@@ -739,7 +739,7 @@ app.get("/scrape", async (req, res) => {
   const targetUrl = buildDpUrl(asin) || originalUrl;
 
   // NEW: configurable bounces + counter
-  const MAX_BOUNCES = 1; // current behavior = one bounce attempt
+  const MAX_BOUNCES = 3; // current behavior = one bounce attempt
   let detourBounceAttempts = 0;
 
   let browser, context, page;
