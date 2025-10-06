@@ -188,22 +188,34 @@ async function closeAttachSideSheetIfVisible(page) {
     return false;
   }
 }
+
 async function clickContinueShoppingIfPresent(page) {
+  // 1) Try popover/side-sheet first (fast path)
   if (await closeAttachSideSheetIfVisible(page)) return true;
 
+  // 2) Known IDs/classes/attrs from overlays and inline layouts
   const KNOWN_SELECTORS = [
+    /* HUC / overlay */
     '#hlb-continue-shopping-announce',
     'a#hlb-continue-shopping-announce',
+    '#attach-close_sideSheet-link',
+
+    /* Inline/cart/confirmation variants */
     '#continue-shopping',
     'button#continue-shopping',
+    'a#continue-shopping',
+    '#sc-continue-shopping',
+    'a#sc-continue-shopping-link',
     'a[href*="continueShopping"]',
     'button[name*="continueShopping"]',
-    'input[type="submit"][value*="Continue shopping" i]',
-    'input[type="submit"][value*="Keep shopping" i]',
+
+    /* Generic text matches via Playwright’s :has-text (visible-only) */
+    'a:has-text("Continue shopping")',
+    'button:has-text("Continue shopping")',
     'a:has-text("Keep shopping")',
     'button:has-text("Keep shopping")',
-    '#attach-close_sideSheet-link',
   ];
+
   for (const sel of KNOWN_SELECTORS) {
     try {
       const el = page.locator(sel).first();
@@ -213,24 +225,40 @@ async function clickContinueShoppingIfPresent(page) {
       }
     } catch {}
   }
-  try {
-    const textLoc = page.locator(
-      'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping"), button:has-text("Keep shopping"), a:has-text("Keep shopping")'
-    );
-    if (await textLoc.first().isVisible({ timeout: 500 }).catch(() => false)) {
-      await textLoc.first().click({ timeout: 2000 }).catch(() => {});
-      return true;
-    }
-  } catch {}
+
+  // 3) DOM-wide fallback: scan common clickables with visibility guard
   try {
     const clicked = await page.evaluate(() => {
-      const nodes = Array.from(
-        document.querySelectorAll('button, a, input[type="submit"], div[role="button"]')
+      const _isNodeVisible = (el) => {
+        if (!el) return false;
+        const style = getComputedStyle(el);
+        if (!style || style.visibility === "hidden" || style.display === "none") return false;
+        const rect = el.getBoundingClientRect?.();
+        if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+        for (let p = el; p; p = p.parentElement) {
+          const s = getComputedStyle(p);
+          if (s && (s.display === "none" || s.visibility === "hidden")) return false;
+        }
+        return true;
+      };
+      const matchText = (txt) => /(^|\W)(continue|keep)\s+shopping(\W|$)/i.test(txt || "");
+      const candidates = Array.from(
+        document.querySelectorAll('a,button,input[type="submit"],[role="button"],span[role="button"]')
       );
-      const target = nodes.find((n) => {
-        const txt = ((n.innerText || n.value || "") + "").toLowerCase();
-        return txt.includes("continue shopping") || txt.includes("keep shopping");
-      });
+      const score = (el) => {
+        const tag = (el.tagName || "").toLowerCase();
+        if (tag === "a" || tag === "button") return 2;
+        if (el.getAttribute("role") === "button") return 1;
+        return 0;
+      };
+      const visibleMatches = candidates
+        .filter((el) => {
+          const text = ((el.innerText || el.value || el.textContent || "") + "").trim();
+          return text && matchText(text) && _isNodeVisible(el);
+        })
+        .sort((a, b) => score(b) - score(a));
+
+      const target = visibleMatches[0];
       if (target) {
         target.scrollIntoView?.({ block: "center", inline: "center" });
         target.click();
@@ -240,8 +268,10 @@ async function clickContinueShoppingIfPresent(page) {
     });
     if (clicked) return true;
   } catch {}
+
   return false;
 }
+
 async function handleContinueShopping(page, context, fallbackUrl) {
   try {
     const clicked = await clickContinueShoppingIfPresent(page);
@@ -409,7 +439,7 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   if (!s) return "Unspecified";
   s = s.replace(/[\u00A0\u2009\u202F]/g, " ");
   const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]/.test(s);
-  const map = { "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4","⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9","₀":"0","₁":"1","₂":"2","₃":"3","₄":"4","₅":"5","₆":"6","₇":"7","₈":"8","₉":"9" };
+  const map = { "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4","⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9","₀":"0","₁":"1","₂":"2","³":"3","₄":"4","₅":"5","₆":"6","₇":"7","₈":"8","₉":"9" };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
   if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
   if (!/\d\.\d{2,}/.test(s) && /(\d+)\s+(\d{2})\b/.test(s)) s = s.replace(/(\d+)\s+(\d{2})\b/, "$1.$2");
@@ -464,6 +494,11 @@ async function scrapeProductData(page) {
     (await page.textContent("#title").catch(() => null));
 
   return await page.evaluate((title) => {
+    const cleanSpaces = (s) => (s || "").replace(/\s+/g, " ").trim();
+    const stripMarks = (s) => (s || "").replace(/[\u200E\u200F\u061C]/g, "");
+    const cleanText = (s) => cleanSpaces(stripMarks(s));
+
+    // -------- Item Form --------
     const itemForm = (() => {
       const row =
         document.querySelector("tr.po-item_form") ||
@@ -471,9 +506,7 @@ async function scrapeProductData(page) {
       if (row) {
         const tds = row.querySelectorAll("td");
         if (tds.length >= 2) {
-          const text = (tds[1].innerText || tds[1].textContent || "")
-            .replace(/\s+/g, " ")
-            .trim();
+          const text = cleanSpaces(tds[1].innerText || tds[1].textContent || "");
           if (text) return text;
         }
       }
@@ -486,9 +519,7 @@ async function scrapeProductData(page) {
       if (altRow) {
         const tds = altRow.querySelectorAll("td");
         if (tds.length >= 2) {
-          const text = (tds[1].innerText || tds[1].textContent || "")
-            .replace(/\s+/g, " ")
-            .trim();
+          const text = cleanSpaces(tds[1].innerText || tds[1].textContent || "");
           if (text) return text;
         }
       }
@@ -496,15 +527,14 @@ async function scrapeProductData(page) {
         document.querySelectorAll("#detailBullets_feature_div li, li")
       ).find((el) => /item\s*form/i.test(el.innerText || el.textContent || ""));
       if (li) {
-        const raw = (li.innerText || li.textContent || "")
-          .replace(/\s+/g, " ")
-          .trim();
+        const raw = cleanSpaces(li.innerText || li.textContent || "");
         const m = raw.match(/item\s*form\s*[:\-]?\s*(.+)$/i);
-        if (m && m[1]) return m[1].trim();
+        if (m && m[1]) return cleanSpaces(m[1]);
       }
       return "";
     })();
 
+    // -------- Price (ensure currency) --------
     const getPriceWithCurrency = () => {
       const priceEl =
         document.querySelector(".a-price .a-offscreen") ||
@@ -514,9 +544,13 @@ async function scrapeProductData(page) {
       const hasCurrency = /[\p{Sc}]|\b[A-Z]{3}\b/u.test(text);
       if (text && !hasCurrency) {
         const sym = document.querySelector(".a-price .a-price-symbol")?.textContent?.trim() || "";
-        if (sym) text = sym + text;
-        else {
-          const iso = document.querySelector('meta[property="og:price:currency"]')?.getAttribute("content") || "";
+        if (sym) {
+          text = sym + text;
+        } else {
+          const iso =
+            document
+              .querySelector('meta[property="og:price:currency"]')
+              ?.getAttribute("content") || "";
           if (iso) text = iso + " " + text;
         }
       }
@@ -524,26 +558,28 @@ async function scrapeProductData(page) {
     };
     const price = getPriceWithCurrency();
 
+    // -------- Featured bullets --------
     const featuredBullets = (() => {
       const items = Array.from(document.querySelectorAll("#feature-bullets ul li"))
-        .map((li) => (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim())
+        .map((li) => cleanSpaces(li.innerText || li.textContent || ""))
         .filter(Boolean)
         .map((text) => `• ${text} `);
       return items.length ? items.join("") : "";
     })();
 
+    // -------- Product Description --------
     const productDescription = (() => {
       const el = document.querySelector("#productDescription");
       if (!el) return "";
-      return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+      return cleanSpaces(el.innerText || el.textContent || "");
     })();
 
+    // -------- Images --------
     const mainImageUrl = (() => {
       const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
       if (imgTag) return imgTag.getAttribute("src") || "";
       return "";
     })();
-
     const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
@@ -557,6 +593,7 @@ async function scrapeProductData(page) {
     if (landing) {
       const oldHires = landing.getAttribute("data-old-hires");
       if (oldHires) fromLandingAttrs.push(oldHires);
+
       const dyn = landing.getAttribute("data-a-dynamic-image");
       if (dyn) {
         try {
@@ -582,7 +619,9 @@ async function scrapeProductData(page) {
     ];
 
     const hiResMatches = Array.from(
-      document.documentElement.innerHTML.matchAll(/https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi)
+      document.documentElement.innerHTML.matchAll(
+        /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi
+      )
     ).map((m) => m[0]);
 
     additionalImageUrls = [...new Set([...additionalImageUrls, ...hiResMatches])];
@@ -607,6 +646,63 @@ async function scrapeProductData(page) {
 
     additionalImageUrls = [...new Set(additionalImageUrls)];
 
+    // -------- New Fields --------
+    // Number of User reviews: from #acrCustomerReviewText, digits only
+    const reviewCount = (() => {
+      const el = document.querySelector("#acrCustomerReviewText");
+      if (!el) return "";
+      const raw = cleanText(el.innerText || el.textContent || "");
+      const digits = (raw.match(/\d/g) || []).join("");
+      return digits || "";
+    })();
+
+    // Product Rating/Star: from #acrPopover@title → strip "out of 5 stars"
+    const rating = (() => {
+      const el = document.querySelector("#acrPopover");
+      const t = el?.getAttribute("title") || el?.getAttribute("aria-label") || "";
+      if (!t) return "";
+      return cleanSpaces(t.replace(/out of 5 stars/i, ""));
+    })();
+
+    // Date First Available: in #detailBullets_feature_div label/value spans
+    const dateFirstAvailable = (() => {
+      const container = document.querySelector("#detailBullets_feature_div");
+      const spans = container ? Array.from(container.querySelectorAll("span")) : [];
+      // Scan for label span
+      for (let i = 0; i < spans.length; i++) {
+        const label = cleanText(spans[i].innerText || spans[i].textContent || "");
+        if (/^date\s*first\s*available/i.test(label)) {
+          // Next non-empty span is the value
+          for (let j = i + 1; j < spans.length; j++) {
+            const val = cleanText(spans[j].innerText || spans[j].textContent || "");
+            if (val) return val;
+          }
+        }
+      }
+      // Fallback: entire list item text
+      const li = Array.from(document.querySelectorAll("#detailBullets_feature_div li, li")).find((el) =>
+        /date\s*first\s*available/i.test(el.innerText || el.textContent || "")
+      );
+      if (li) {
+        const raw = cleanText(li.innerText || li.textContent || "");
+        const m = raw.match(/date\s*first\s*available\s*[:\-]?\s*(.+)$/i);
+        if (m && m[1]) return cleanText(m[1]);
+      }
+      // Fallback: tables in product details
+      const ths = Array.from(
+        document.querySelectorAll(
+          "#productDetails_detailBullets_sections1 th, #productDetails_techSpec_section_1 th, #productDetails_techSpec_section_2 th"
+        )
+      );
+      for (const th of ths) {
+        if (/date\s*first\s*available/i.test(th.textContent || "")) {
+          const td = th.nextElementSibling;
+          if (td) return cleanText(td.textContent || "");
+        }
+      }
+      return "";
+    })();
+
     return {
       title: (title || "").trim(),
       itemForm: (itemForm || "").trim(),
@@ -615,6 +711,10 @@ async function scrapeProductData(page) {
       productDescription: (productDescription || "").trim(),
       mainImageUrl: normalizedMain || "",
       additionalImageUrls,
+      // New fields:
+      reviewCount,
+      rating,
+      dateFirstAvailable,
     };
   }, title);
 }
@@ -628,6 +728,11 @@ async function waitForDetourOrProduct(page, settleMs = 3500) {
     const u = page.url();
     if (u !== lastUrl) { lastUrl = u; await sleep(150); }
     if (isLikelyDetourUrl(u) || isProductUrl(u)) return u;
+    // Treat visible inline "Continue/Keep shopping" as a detour signal too
+    try {
+      const hasInline = await hasInlineContinueShopping(page);
+      if (hasInline) return u;
+    } catch {}
     if (await hasProductTitle(page).catch(() => false)) return u;
     await Promise.race([
       page.waitForNavigation({ waitUntil: "commit", timeout: 500 }).catch(() => null),
@@ -650,6 +755,78 @@ async function detectAndBounceIfDetour(page, context, targetUrl, { maxBounces = 
   }
 
   return { page, attempts, currentUrl };
+}
+
+/* ------------- Inline/overlay Continue Shopping robust detection ----------- */
+async function hasInlineContinueShopping(page) {
+  return await page.evaluate(() => {
+    const _isNodeVisible = (el) => {
+      if (!el) return false;
+      const style = getComputedStyle(el);
+      if (!style || style.visibility === "hidden" || style.display === "none") return false;
+      const rect = el.getBoundingClientRect?.();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      for (let p = el; p; p = p.parentElement) {
+        const s = getComputedStyle(p);
+        if (s && (s.display === "none" || s.visibility === "hidden")) return false;
+      }
+      return true;
+    };
+    const matchText = (txt) => /(^|\W)(continue|keep)\s+shopping(\W|$)/i.test(txt || "");
+    const nodes = document.querySelectorAll(
+      'a,button,input[type="submit"],[role="button"],span[role="button"]'
+    );
+    for (const el of nodes) {
+      const text = ((el.innerText || el.value || el.textContent || "") + "").trim();
+      if (text && matchText(text) && _isNodeVisible(el)) return true;
+    }
+    return false;
+  });
+}
+
+// Dismiss Continue/Keep Shopping once (inline or popover) and wait for settle
+async function dismissContinueShoppingOnce(page, context, fallbackUrl) {
+  const clicked = await clickContinueShoppingIfPresent(page);
+  if (!clicked) return false;
+
+  const popup = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
+  const nav   = page.waitForNavigation({ waitUntil: "commit", timeout: 15000 }).catch(() => null);
+  const dcl   = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => null);
+  await Promise.race([popup, nav, dcl]);
+
+  let active = context.pages().find((p) => !p.isClosed() && p.url() !== "about:blank") || page;
+  if (active.isClosed()) {
+    active = await context.newPage();
+    try { await active.bringToFront(); } catch {}
+    if (fallbackUrl) await safeGoto(active, fallbackUrl, { retries: 1, timeout: 60000 });
+  }
+  return true;
+}
+
+// Loop: make the page "product-ready" by dismissing Continue/Keep Shopping up to maxRounds
+async function ensureProductReady(page, context, targetUrl, { maxRounds = 3, settleMs = 1200 } = {}) {
+  for (let round = 0; round < maxRounds; round++) {
+    if (await isProductPage(page)) break;
+
+    const maybeContinue =
+      (await hasInlineContinueShopping(page).catch(() => false)) ||
+      (await closeAttachSideSheetIfVisible(page).catch(() => false));
+
+    if (maybeContinue) {
+      const did = await dismissContinueShoppingOnce(page, context, targetUrl);
+      if (did) {
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: "commit", timeout: 800 }).catch(() => null),
+          page.waitForLoadState("domcontentloaded", { timeout: 800 }).catch(() => null),
+          sleep(300),
+        ]);
+        continue;
+      }
+    }
+    await sleep(settleMs);
+    if (await isProductPage(page)) break;
+  }
+  return { page };
 }
 
 /* -------------------------------- Endpoints -------------------------------- */
@@ -676,7 +853,7 @@ app.get("/scrape", async (req, res) => {
     await safeGoto(page, originalUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Handle possible overlay first
+    // Early overlay cleanup (some detours are overlay-triggered)
     page = await handleContinueShopping(page, context, targetUrl);
     ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
 
@@ -725,6 +902,9 @@ app.get("/scrape", async (req, res) => {
         counts,
       });
     }
+
+    // Ensure product is "ready": dismiss inline/overlay Continue Shopping up to 3 rounds
+    await ensureProductReady(page, context, targetUrl, { maxRounds: 3, settleMs: 1200 });
 
     // Confirm product-like DOM
     let productLike;
@@ -830,6 +1010,10 @@ app.get("/scrape", async (req, res) => {
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
+      // New fields:
+      reviewCount: scraped.reviewCount || "Unspecified",
+      rating: scraped.rating || "Unspecified",
+      dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
       screenshot: base64,
     });
   } catch (err) {
