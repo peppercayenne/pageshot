@@ -28,7 +28,9 @@ if (!process.env.GEMINI_API_KEY) {
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-/* ---------------------------- Playwright context --------------------------- */
+/**
+ * Minimal Playwright context
+ */
 async function minimalContext(width, height) {
   const browser = await chromium.launch({
     headless: true,
@@ -55,22 +57,29 @@ async function minimalContext(width, height) {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
   });
 
-  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
+  await page.setExtraHTTPHeaders({
+    "accept-language": "en-US,en;q=0.9",
+  });
 
+  // Return context so we can adopt new pages/popups later
   return { browser, context, page };
 }
 
-/* --------------------------------- Helpers -------------------------------- */
+/**
+ * Simple helpers
+ */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
 
 function ensureAlive(page, msg = "Page is closed") {
   if (!page || page.isClosed()) throw new Error(msg);
 }
+
 function isClosedErr(err) {
   const msg = (err && err.message) || String(err || "");
   return /Target page, context or browser has been closed/i.test(msg);
 }
+
 async function adoptActivePageOrThrow(currentPage, context) {
   if (currentPage && !currentPage.isClosed()) return currentPage;
   const pages = context.pages().filter((p) => !p.isClosed());
@@ -85,22 +94,6 @@ async function adoptActivePageOrThrow(currentPage, context) {
   throw new Error("All pages are closed");
 }
 
-function extractASINFromUrl(u = "") {
-  try {
-    const url = new URL(u);
-    const path = url.pathname;
-    const m1 = path.match(/\/dp\/([A-Z0-9]{8,10})/i);
-    const m2 = path.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
-    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
-  } catch {
-    const m1 = u.match(/\/dp\/([A-Z0-9]{8,10})/i);
-    const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
-    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
-  }
-}
-const isDpUrl = (u = "") => /\/dp\/[A-Z0-9]{8,10}/i.test(u);
-const buildDpUrl = (asin) => (asin ? `https://www.amazon.com/dp/${asin}` : "");
-
 function isRobotCheckUrl(url) {
   if (!url) return false;
   return (
@@ -109,86 +102,43 @@ function isRobotCheckUrl(url) {
     url.includes("/sorry")
   );
 }
+
 async function looksBlocked(page) {
   try {
     const url = page.url();
     if (isRobotCheckUrl(url)) return true;
+
     const title = (await page.title().catch(() => "")) || "";
     if (/robot check/i.test(title) || /captcha/i.test(title)) return true;
+
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
-    if (/enter the characters|type the characters|sorry/i.test(bodyText)) return true;
+    if (
+      /enter the characters/i.test(bodyText) ||
+      /type the characters/i.test(bodyText) ||
+      /sorry/i.test(bodyText)
+    ) {
+      return true;
+    }
   } catch {}
   return false;
 }
-function isLikelyDetourUrl(u = "") {
-  return (
-    /\/hz\/mobile\/mission/i.test(u) ||
-    /\/ap\/signin/i.test(u) ||
-    /\/gp\/help/i.test(u) ||
-    /\/gp\/navigation/i.test(u) ||
-    /\/customer-preferences/i.test(u) ||
-    /\/gp\/yourstore/i.test(u) ||
-    /\/gp\/history/i.test(u)
-  );
-}
 
-/* --------------------- Overlay suppression (1: network+CSS) --------------- */
-async function installAttachBlockers(context, page) {
-  if (!context._attachBlockersInstalled) {
-    const patterns = [
-      /https:\/\/[^/]*amazon\.[^/]+\/hz\/attach/i,     // attach side-sheet endpoints
-      /https:\/\/[^/]*amazon\.[^/]+\/gp\/huc\//i,      // HUC overlay
-      /https:\/\/[^/]*amazon\.[^/]+\/.*attach.*sheet/i // extra conservative
-    ];
-    for (const re of patterns) {
-      await context.route(re, (r) => r.abort()).catch(() => {});
-    }
-    context._attachBlockersInstalled = true;
-  }
-
-  // CSS/DOM kill-switch to remove any overlay that still sneaks in
-  await page.addInitScript(() => {
-    const kill = () => {
-      const sels = [
-        '#attach-desktop-sideSheet',
-        '#attachAccessoryView',
-        'iframe[name*="attach"]',
-        'iframe#attachSideSheet',
-        'iframe#attach-sidesheet-frame'
-      ];
-      for (const sel of sels) document.querySelectorAll(sel).forEach((el) => el.remove());
-      let style = document.getElementById('__attach_kill__');
-      if (!style) {
-        style = document.createElement('style');
-        style.id = '__attach_kill__';
-        document.head.appendChild(style);
-      }
-      style.textContent = `
-        #attach-desktop-sideSheet, #attachAccessoryView,
-        iframe[name*="attach"], iframe#attachSideSheet, iframe#attach-sidesheet-frame {
-          display: none !important;
-          visibility: hidden !important;
-          opacity: 0 !important;
-          pointer-events: none !important;
-        }`;
-    };
-    kill();
-    new MutationObserver(kill).observe(document.documentElement, { childList: true, subtree: true });
-    window.addEventListener('load', kill, { once: true });
-    document.addEventListener('DOMContentLoaded', kill, { once: true });
-  });
-}
-
-/* ---------------------------- Navigation helpers -------------------------- */
+/**
+ * Navigation with retry + CAPTCHA detection
+ */
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let attempt = 0;
   let lastErr;
+
   while (attempt <= retries) {
     try {
       await sleep(jitter(250, 500));
       await page.goto(url, { timeout, waitUntil: "commit" });
       await sleep(jitter(700, 600));
-      if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
+
+      if (await looksBlocked(page)) {
+        throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
+      }
       return;
     } catch (err) {
       lastErr = err;
@@ -200,6 +150,9 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   throw lastErr || new Error("Navigation failed");
 }
 
+/**
+ * Close the "Added to Cart" side sheet if visible
+ */
 async function closeAttachSideSheetIfVisible(page) {
   try {
     const closed = await page.evaluate(() => {
@@ -226,194 +179,100 @@ async function closeAttachSideSheetIfVisible(page) {
   }
 }
 
-async function hasProductTitle(page) {
-  try {
-    return await page.evaluate(() => {
-      return !!(document.querySelector("#productTitle") || document.querySelector("#title"));
-    });
-  } catch {
-    return false;
-  }
-}
-
-/* ------------------ Attach/HLB detection & settle helpers ----------------- */
-function likelyAttachFrame(f) {
-  const name = (f.name() || "");
-  const url = (f.url() || "");
-  return /attach|sidesheet|hlb|add-to-cart|upsell/i.test(name) || /attach|sidesheet|hlb|add-to-cart|upsell/i.test(url);
-}
-function getAttachFrames(page) {
-  return page.frames().filter(likelyAttachFrame);
-}
-async function isAttachOverlayVisible(page) {
-  try {
-    return await page.evaluate(() => {
-      if (document.querySelector('#attach-desktop-sideSheet') ||
-          document.querySelector('#attachAccessoryView')) return true;
-      const iframes = Array.from(document.querySelectorAll('iframe'));
-      return iframes.some(f =>
-        /attach|sidesheet|hlb|add-to-cart|upsell/i.test(f.name || '') ||
-        /attach|sidesheet|hlb|add-to-cart|upsell/i.test(f.src || '')
-      );
-    });
-  } catch { return false; }
-}
-async function waitForOverlayToSettleOrTitle(page, timeout = 7000) {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    try {
-      const overlayGone = !(await isAttachOverlayVisible(page));
-      const titleBack   = await hasProductTitle(page).catch(() => false);
-      if (overlayGone || titleBack) return true;
-    } catch {}
-    await sleep(150);
-  }
-  return false;
-}
-// Give product DOM a chance to appear before we classify detours
-async function waitProductMarkers(page, ms = 3500) {
-  try {
-    await page.waitForSelector('#productTitle, #titleSection #title, #dp, #ppd', { timeout: ms });
-  } catch {}
-}
-
-/* ---------------- Improved Continue Shopping logic (frame-aware) ---------- */
-// Count dismissals, not retries: onClick() is only fired if overlay was visible and now gone.
-async function clickContinueShoppingIfPresent(page, onClick) {
-  // explicit close in main frame
-  {
-    const was = await isAttachOverlayVisible(page);
-    if (await closeAttachSideSheetIfVisible(page)) {
-      await waitForOverlayToSettleOrTitle(page, 5000);
-      const now = await isAttachOverlayVisible(page);
-      if (was && !now) onClick?.();
-      return true;
-    }
+/**
+ * Detect & click "Continue/Keep shopping" if present
+ */
+async function clickContinueShoppingIfPresent(page) {
+  if (await closeAttachSideSheetIfVisible(page)) {
+    return true;
   }
 
-  // candidates in main frame
-  const pageCandidates = [
-    page.getByRole('button', { name: /continue shopping|keep shopping/i }),
-    page.getByRole('link',   { name: /continue shopping|keep shopping/i }),
-    page.locator('#hlb-continue-shopping-announce'),
-    page.locator('#continue-shopping'),
-    page.locator('a#hlb-continue-shopping-announce'),
-    page.locator('#attach-close_sideSheet-link'),
-    page.locator('input[type="submit"]').filter({ hasText: /continue shopping|keep shopping/i }),
-    page.locator('button, a, input[type="submit"], [role="button"]').filter({ hasText: /continue shopping|keep shopping/i }),
+  const KNOWN_SELECTORS = [
+    '#hlb-continue-shopping-announce',
+    'a#hlb-continue-shopping-announce',
+    '#continue-shopping',
+    'button#continue-shopping',
+    'a[href*="continueShopping"]',
+    'button[name*="continueShopping"]',
+    'input[type="submit"][value*="Continue shopping" i]',
+    'input[type="submit"][value*="Keep shopping" i]',
+    'a:has-text("Keep shopping")',
+    'button:has-text("Keep shopping")',
+    '#attach-close_sideSheet-link',
   ];
 
-  // candidates in attach/HLB iframes
-  const frameCandidates = [];
-  for (const f of getAttachFrames(page)) {
-    frameCandidates.push(
-      f.getByRole('button', { name: /continue shopping|keep shopping/i }),
-      f.getByRole('link',   { name: /continue shopping|keep shopping/i }),
-      f.locator('#hlb-continue-shopping-announce'),
-      f.locator('#attach-close_sideSheet-link'),
-      f.locator('button, a, input[type="submit"], [role="button"]').filter({ hasText: /continue shopping|keep shopping/i }),
-    );
-  }
-
-  const tryClick = async (loc) => {
+  for (const sel of KNOWN_SELECTORS) {
     try {
-      if (await loc.isVisible({ timeout: 400 }).catch(() => false)) {
-        const was = await isAttachOverlayVisible(page);
-        try { await loc.scrollIntoViewIfNeeded({ timeout: 500 }); } catch {}
-        await loc.click({ timeout: 1500 }).catch(() => {});
-        await waitForOverlayToSettleOrTitle(page, 5000);
-        const now = await isAttachOverlayVisible(page);
-        if (was && !now) onClick?.();
+      const el = page.locator(sel).first();
+      if (await el.isVisible({ timeout: 500 }).catch(() => false)) {
+        await el.click({ timeout: 2000 }).catch(() => {});
         return true;
       }
     } catch {}
-    return false;
-  };
-
-  for (const loc of [...pageCandidates, ...frameCandidates]) {
-    if (await tryClick(loc)) return true;
   }
 
-  // Soft fallback: Esc to dismiss side-sheet
-  {
-    const was = await isAttachOverlayVisible(page);
-    try { await page.keyboard.press('Escape'); } catch {}
-    await waitForOverlayToSettleOrTitle(page, 2500);
-    const now = await isAttachOverlayVisible(page);
-    if (was && !now) {
-      onClick?.();
+  try {
+    const textLoc = page.locator(
+      'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping"), button:has-text("Keep shopping"), a:has-text("Keep shopping")'
+    );
+    if (await textLoc.first().isVisible({ timeout: 500 }).catch(() => false)) {
+      await textLoc.first().click({ timeout: 2000 }).catch(() => {});
       return true;
     }
-  }
+  } catch {}
 
-  return false;
-}
-
-// EXACT request: tries up to maxTries rounds; each round one click attempt then settle
-async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
-  for (let i = 0; i < maxTries; i++) {
-    let attempted = false;
-
-    const attemptTextClick = async (scope) => {
-      const t = scope.getByText(/continue shopping|keep shopping/i).first();
-      if (await t.isVisible({ timeout: 600 }).catch(() => false)) {
-        const was = await isAttachOverlayVisible(page);
-        await t.click({ timeout: 1500 }).catch(() => {});
-        attempted = true;
-        await Promise.race([
-          page.waitForNavigation({ waitUntil: "commit", timeout: 3000 }).catch(() => null),
-          page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => null),
-          waitForOverlayToSettleOrTitle(page, 3000),
-        ]);
-        const now = await isAttachOverlayVisible(page);
-        if (was && !now) onClick?.();
+  try {
+    const clicked = await page.evaluate(() => {
+      const nodes = Array.from(
+        document.querySelectorAll('button, a, input[type="submit"], div[role="button"]')
+      );
+      const target = nodes.find((n) => {
+        const txt = ((n.innerText || n.value || "") + "").toLowerCase();
+        return txt.includes("continue shopping") || txt.includes("keep shopping");
+      });
+      if (target) {
+        target.scrollIntoView?.({ block: "center", inline: "center" });
+        target.click();
         return true;
       }
       return false;
-    };
+    });
+    if (clicked) return true;
+  } catch {}
 
-    if (await attemptTextClick(page)) {
-      if (await hasProductTitle(page)) return true;
-    } else {
-      for (const f of getAttachFrames(page)) {
-        if (await attemptTextClick(f)) break;
-      }
-    }
-
-    if (await hasProductTitle(page)) return true;
-
-    // Try Esc between attempts (no increment unless it truly dismisses)
-    const was = await isAttachOverlayVisible(page);
-    if (!attempted) {
-      try { await page.keyboard.press('Escape'); } catch {}
-      await sleep(300);
-      const now = await isAttachOverlayVisible(page);
-      if (was && !now) onClick?.();
-    }
-  }
   return false;
 }
 
-async function handleContinueShopping(page, context, fallbackUrl, onClick) {
+/**
+ * Handle "Continue/Keep shopping" and return a guaranteed alive page.
+ * If Amazon kills the tab and no replacement appears, open a **new page**
+ * and reload the provided fallback URL.
+ */
+async function handleContinueShopping(page, context, fallbackUrl) {
   try {
-    const clicked = await clickContinueShoppingIfPresent(page, onClick);
+    const clicked = await clickContinueShoppingIfPresent(page);
     if (!clicked) return page;
 
-    const popupPromise  = context.waitForEvent("page", { timeout: 6000 }).catch(() => null);
-    const navPromise    = page.waitForNavigation({ timeout: 10000, waitUntil: "commit" }).catch(() => null);
-    const dclPromise    = page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => null);
-    const settlePromise = waitForOverlayToSettleOrTitle(page, 5000);
-    await Promise.race([popupPromise, navPromise, dclPromise, settlePromise]);
+    const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
+    const navPromise = page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }).catch(() => null);
+    const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => null);
 
-    const active = context.pages().find((p) => !p.isClosed() && p.url() !== "about:blank");
-    if (active) {
+    await Promise.race([popupPromise, navPromise, dclPromise]);
+
+    const pages = context.pages();
+    const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
+    if (active && active !== page) {
       try { await active.bringToFront(); } catch {}
       return active;
     }
 
+    if (page && !page.isClosed()) return page;
+
     const fresh = await context.newPage();
     try { await fresh.bringToFront(); } catch {}
-    if (fallbackUrl) await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
+    if (fallbackUrl) {
+      await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
+    }
     return fresh;
   } catch {
     try {
@@ -422,396 +281,17 @@ async function handleContinueShopping(page, context, fallbackUrl, onClick) {
     } catch {
       const fresh = await context.newPage();
       try { await fresh.bringToFront(); } catch {}
-      if (fallbackUrl) await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
+      if (fallbackUrl) {
+        await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
+      }
       return fresh;
     }
   }
 }
 
-/* ------------------------------ Product scrape ---------------------------- */
-async function scrapeProductData(page) {
-  const title =
-    (await page.textContent("#productTitle").catch(() => null)) ||
-    (await page.textContent("#title").catch(() => null));
-
-  return await page.evaluate((title) => {
-    const itemForm = (() => {
-      const row =
-        document.querySelector("tr.po-item_form") ||
-        document.querySelector('tr[class*="po-item_form"]');
-      if (row) {
-        const tds = row.querySelectorAll("td");
-        if (tds.length >= 2) {
-          const text = (tds[1].innerText || tds[1].textContent || "").replace(/\s+/g, " ").trim();
-          if (text) return text;
-        }
-      }
-      const altRow = Array.from(document.querySelectorAll("tr")).find((tr) => {
-        const firstTd = tr.querySelector("td");
-        if (!firstTd) return false;
-        const label = (firstTd.innerText || firstTd.textContent || "").toLowerCase();
-        return /item\s*form/.test(label);
-      });
-      if (altRow) {
-        const tds = altRow.querySelectorAll("td");
-        if (tds.length >= 2) {
-          const text = (tds[1].innerText || tds[1].textContent || "").replace(/\s+/g, " ").trim();
-          if (text) return text;
-        }
-      }
-      const li = Array.from(document.querySelectorAll("#detailBullets_feature_div li, li")).find((el) =>
-        /item\s*form/i.test(el.innerText || el.textContent || "")
-      );
-      if (li) {
-        const raw = (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim();
-        const m = raw.match(/item\s*form\s*[:\-]?\s*(.+)$/i);
-        if (m && m[1]) return m[1].trim();
-      }
-      return "";
-    })();
-
-    const getPriceWithCurrency = () => {
-      const priceEl =
-        document.querySelector(".a-price .a-offscreen") ||
-        document.querySelector("#priceblock_ourprice, #priceblock_dealprice, #priceblock_saleprice");
-      let text = (priceEl?.textContent || "").trim();
-      const hasCurrency = /[\p{Sc}]|\b[A-Z]{3}\b/u.test(text);
-      if (text && !hasCurrency) {
-        const sym = document.querySelector(".a-price .a-price-symbol")?.textContent?.trim() || "";
-        if (sym) text = sym + text;
-        else {
-          const iso = document.querySelector('meta[property="og:price:currency"]')?.getAttribute("content") || "";
-          if (iso) text = iso + " " + text;
-        }
-      }
-      return text || "";
-    };
-    const price = getPriceWithCurrency();
-
-    const featuredBullets = (() => {
-      const items = Array.from(document.querySelectorAll("#feature-bullets ul li"))
-        .map((li) => (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim())
-        .filter(Boolean)
-        .map((text) => `• ${text} `);
-      return items.length ? items.join("") : "";
-    })();
-
-    const productDescription = (() => {
-      const el = document.querySelector("#productDescription");
-      if (!el) return "";
-      return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
-    })();
-
-    const mainImageUrl = (() => {
-      const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
-      if (imgTag) return imgTag.getAttribute("src") || "";
-      return "";
-    })();
-
-    const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
-    const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
-
-    let additionalImageUrls = Array.from(document.querySelectorAll("#altImages img, .imageThumb img"))
-      .map((img) => img.getAttribute("src") || "")
-      .map((src) => (src || "").trim())
-      .filter(Boolean);
-
-    const landing = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
-    const fromLandingAttrs = [];
-    if (landing) {
-      const oldHires = landing.getAttribute("data-old-hires");
-      if (oldHires) fromLandingAttrs.push(oldHires);
-      const dyn = landing.getAttribute("data-a-dynamic-image");
-      if (dyn) {
-        try {
-          const clean = dyn.replace(/&quot;/g, '"');
-          const obj = JSON.parse(clean);
-          for (const k of Object.keys(obj || {})) fromLandingAttrs.push(k);
-        } catch {
-          try {
-            const clean2 = dyn
-              .replace(/&quot;/g, '"')
-              .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
-              .replace(/:\s*'([^']+?)'(\s*[},])/g, ':"$1"$2');
-            const obj2 = JSON.parse(clean2);
-            for (const k of Object.keys(obj2 || {})) fromLandingAttrs.push(k);
-          } catch {}
-        }
-      }
-    }
-
-    additionalImageUrls = [
-      ...additionalImageUrls,
-      ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
-    ];
-
-    const hiResMatches = Array.from(
-      document.documentElement.innerHTML.matchAll(/https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi)
-    ).map((m) => m[0]);
-
-    additionalImageUrls = [...new Set([...additionalImageUrls, ...hiResMatches])];
-
-    additionalImageUrls = additionalImageUrls.filter((src) => {
-      if (!src) return false;
-      const lower = src.toLowerCase();
-      return !(
-        lower.includes("sprite") ||
-        lower.includes("360_icon") ||
-        lower.includes("play-icon") ||
-        lower.includes("overlay") ||
-        lower.includes("fmjpg") ||
-        lower.includes("fmpng")
-      );
-    });
-
-    const AC_ANY = /\._AC_SL\d+_\.jpg(?:\?.*)?$/i;
-    additionalImageUrls = additionalImageUrls
-      .filter((url) => url && url !== normalizedMain)
-      .filter((url) => AC_ANY.test(url));
-
-    additionalImageUrls = [...new Set(additionalImageUrls)];
-
-    return {
-      title: (title || "").trim(),
-      itemForm: itemForm.trim(),
-      price: (price || "").trim(),
-      featuredBullets: (featuredBullets || "").trim(),
-      productDescription: (productDescription || "").trim(),
-      mainImageUrl: normalizedMain || "",
-      additionalImageUrls,
-    };
-  }, title);
-}
-
-/* ------------------------------- Gemini OCR ------------------------------- */
-function includesCurrency(s = "") {
-  return /[\p{Sc}]|\b[A-Z]{3}\b/u.test(s);
-}
-function currencyToken(s = "") {
-  const m = s.match(/([\p{Sc}]|\b[A-Z]{3}\b)/u);
-  return m ? m[1] : "";
-}
-function normalizeGeminiPrice(raw = "", domPrice = "") {
-  let s = (raw || "").trim();
-  if (!s) return "Unspecified";
-  s = s.replace(/[\u00A0\u2009\u202F]/g, " ");
-  const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]/.test(s);
-  const map = {
-    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
-    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
-    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
-    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
-  };
-  s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
-  if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
-  if (!/\d\.\d{2,}/.test(s) && /(\d+)\s+(\d{2})\b/.test(s)) s = s.replace(/(\d+)\s+(\d{2})\b/, "$1.$2");
-  if (hadSuper && !/\d\.\d{2,}/.test(s)) {
-    const digits = (s.match(/\d+/g) || []).join("");
-    if (digits.length >= 3) {
-      const num = `${digits.slice(0, -2)}.${digits.slice(-2)}`;
-      const cur = currencyToken(s) || currencyToken(domPrice);
-      s = cur ? `${cur} ${num}` : num;
-    }
-  }
-  if (!includesCurrency(s) && includesCurrency(domPrice)) {
-    const cur = currencyToken(domPrice);
-    if (cur) s = `${cur} ${s}`;
-  }
-  s = s.replace(/\s+/g, " ").trim();
-  return s || "Unspecified";
-}
-
-async function geminiExtract(base64Image) {
-  const prompt = `
-You are given a screenshot of an Amazon product page.
-Extract JSON with exactly these keys:
-- brand: string (brand or manufacturer name)
-- price: string (include currency symbol or ISO code, e.g., "$12.99" or "USD 12.99")
-Rules:
-- Return ONLY valid minified JSON: {"brand":"...","price":"..."}
-- If a field is unknown or not visible, use "Unspecified".`;
-
-  const result = await model.generateContent([
-    { text: prompt },
-    { inlineData: { mimeType: "image/png", data: base64Image } },
-  ]);
-
-  let text = result.response.text().trim();
-  text = text.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
-
-  try {
-    const parsed = JSON.parse(text);
-    return {
-      brand: typeof parsed.brand === "string" ? parsed.brand.trim() : "Unspecified",
-      price: typeof parsed.price === "string" ? parsed.price.trim() : "Unspecified",
-    };
-  } catch {
-    return { brand: "Unspecified", price: "Unspecified" };
-  }
-}
-
-/* -------------------------------- Endpoint -------------------------------- */
-app.get("/", (req, res) => {
-  res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
-});
-
-app.get("/scrape", async (req, res) => {
-  const inputUrl = req.query.url;
-  if (!inputUrl) return res.status(400).json({ ok: false, error: "Missing url param" });
-
-  const width = 1280, height = 800;
-  const asin = extractASINFromUrl(inputUrl);
-  const intendedDpUrl = buildDpUrl(asin);
-  const returnUrl = intendedDpUrl || inputUrl; // we will report this in JSON
-
-  let browser, context, page;
-  // Stats
-  let nonProductCount = 0;
-  const nonProductUrls = [];
-  let continueShoppingClicks = 0;
-
-  try {
-    const ctx = await minimalContext(width, height);
-    browser = ctx.browser;
-    context = ctx.context;
-    page = ctx.page;
-
-    // (1) Install attach/HLB blockers BEFORE first navigation
-    await installAttachBlockers(context, page);
-
-    // First nav: go to the given URL
-    await safeGoto(page, inputUrl, { retries: 2, timeout: 60000 });
-    ensureAlive(page, "Page unexpectedly closed after navigation");
-
-    // If we get detoured and we know the intended /dp/ASIN, bounce back immediately (up to 3 tries)
-    const bounceBackToDp = async () => {
-      if (!intendedDpUrl) return;
-      for (let i = 0; i < 3; i++) {
-        const curUrl = page.url();
-
-        // (2) Reduce false positives: wait briefly for product markers
-        await waitProductMarkers(page, 3500);
-        const productish = await isProductPage(page);
-
-        if (productish || isDpUrl(curUrl)) break;
-
-        if (isLikelyDetourUrl(curUrl) || !isDpUrl(curUrl)) {
-          // only count/log non-dp URLs as detours
-          if (!isDpUrl(curUrl)) {
-            nonProductCount++;
-            nonProductUrls.push(curUrl);
-          }
-          await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
-          await handleContinueShopping(page, context, intendedDpUrl, () => continueShoppingClicks++);
-          if (!(await hasProductTitle(page))) {
-            await trySimpleContinueShoppingFallback(page, 3, () => continueShoppingClicks++);
-          }
-          if (await isProductPage(page)) break;
-        }
-      }
-    };
-
-    await bounceBackToDp();
-
-    // If we are on /dp/ but no title yet, do the explicit click fallback
-    if (isDpUrl(page.url()) && !(await hasProductTitle(page))) {
-      await trySimpleContinueShoppingFallback(page, 3, () => continueShoppingClicks++);
-    }
-
-    // Final product check
-    let productLike = await isProductPage(page);
-
-    // If we're still not on a product page and know ASIN, one final bounce-to-dp
-    if (!productLike && intendedDpUrl) {
-      const u = page.url();
-      await waitProductMarkers(page, 3500);
-      if (!isDpUrl(u)) {
-        nonProductCount++;
-        nonProductUrls.push(u);
-      }
-      await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
-      await handleContinueShopping(page, context, intendedDpUrl, () => continueShoppingClicks++);
-      if (!(await hasProductTitle(page))) {
-        await trySimpleContinueShoppingFallback(page, 3, () => continueShoppingClicks++);
-      }
-      productLike = await isProductPage(page);
-    }
-
-    // Take screenshot (for both success and non-product shapes)
-    let buf;
-    try {
-      buf = await safeScreenshot(page, { type: "png" }, 1);
-    } catch (e) {
-      if (isClosedErr(e)) {
-        page = await adoptActivePageOrThrow(page, context);
-        buf = await safeScreenshot(page, { type: "png" }, 1);
-      } else {
-        throw e;
-      }
-    }
-    const base64 = buf.toString("base64");
-
-    // If it's NOT a product page: return the product-shaped JSON with Unspecifieds
-    if (!productLike) {
-      return res.json({
-        ok: true,
-        url: returnUrl,
-        pageType: "product",
-        ASIN: asin || "Unspecified",
-        title: "Unspecified",
-        brand: "Unspecified",
-        itemForm: "Unspecified",
-        price: "Unspecified",
-        priceGemini: "Unspecified",
-        featuredBullets: "Unspecified",
-        productDescription: "Unspecified",
-        mainImageUrl: "Unspecified",
-        additionalImageUrls: [],
-        nonProductCount,
-        nonProductUrls,
-        continueShoppingClicks,
-        screenshot: base64,
-      });
-    }
-
-    // Otherwise scrape DOM + OCR
-    const scraped = await scrapeProductData(page);
-    ensureAlive(page, "Page closed before OCR");
-    const gem = await geminiExtract(base64);
-    const priceGemini = normalizeGeminiPrice(gem.price, scraped.price);
-
-    res.json({
-      ok: true,
-      url: page.url() || returnUrl,
-      pageType: "product",
-      ASIN: asin || "Unspecified",
-      title: scraped.title || "Unspecified",
-      brand: gem.brand || "Unspecified",
-      itemForm: scraped.itemForm || "Unspecified",
-      price: scraped.price || "Unspecified",
-      priceGemini: priceGemini || "Unspecified",
-      featuredBullets: scraped.featuredBullets || "Unspecified",
-      productDescription: scraped.productDescription || "Unspecified",
-      mainImageUrl: scraped.mainImageUrl || "Unspecified",
-      additionalImageUrls: scraped.additionalImageUrls || [],
-      nonProductCount,
-      nonProductUrls,
-      continueShoppingClicks,
-      screenshot: base64,
-    });
-  } catch (err) {
-    res.status(500).json({ ok: false, error: err?.message || String(err) });
-  } finally {
-    try {
-      for (const p of context?.pages?.() || []) {
-        try { if (!p.isClosed()) await p.close({ runBeforeUnload: false }); } catch {}
-      }
-    } catch {}
-    try { await browser?.close(); } catch {}
-  }
-});
-
-/* ------------------------------- Utilities -------------------------------- */
+/**
+ * Safer screenshot with a small retry
+ */
 async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
@@ -834,6 +314,9 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
   throw lastErr || new Error("Screenshot failed");
 }
 
+/**
+ * Heuristic: are we on a proper Amazon product page?
+ */
 async function isProductPage(page) {
   try {
     return await page.evaluate(() => {
@@ -860,6 +343,9 @@ async function isProductPage(page) {
   }
 }
 
+/**
+ * Extract all <a> and button-like elements (used on non-product pages)
+ */
 async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
   return await page.evaluate((limits) => {
     const toAbs = (u) => {
@@ -910,7 +396,7 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
       };
     });
 
-    // de-dupe
+    // Simple de-dupe
     const seenL = new Set();
     const dedupLinks = [];
     for (const l of links) {
@@ -920,6 +406,7 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
         dedupLinks.push(l);
       }
     }
+
     const seenB = new Set();
     const dedupButtons = [];
     for (const b of buttons) {
@@ -930,9 +417,456 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
       }
     }
 
-    return { links: dedupLinks, buttons: dedupButtons, counts: { links: links.length, buttons: buttons.length } };
+    return {
+      links: dedupLinks,
+      buttons: dedupButtons,
+      counts: { links: links.length, buttons: buttons.length },
+    };
   }, limits);
 }
+
+/**
+ * Scrape product data from DOM (Playwright-only fields)
+ * NOTE: Brand is NOT scraped here (Gemini OCR handles brand).
+ */
+async function scrapeProductData(page) {
+  const title =
+    (await page.textContent("#productTitle").catch(() => null)) ||
+    (await page.textContent("#title").catch(() => null));
+
+  return await page.evaluate((title) => {
+    // -------- Item Form (prefer Product Overview row .po-item_form) --------
+    const itemForm = (() => {
+      // 1) Primary: <tr class="... po-item_form ..."> → value in 2nd <td>
+      const row =
+        document.querySelector("tr.po-item_form") ||
+        document.querySelector('tr[class*="po-item_form"]');
+      if (row) {
+        const tds = row.querySelectorAll("td");
+        if (tds.length >= 2) {
+          const text = (tds[1].innerText || tds[1].textContent || "")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (text) return text;
+        }
+      }
+      // 2) Any row where first <td> label contains "Item Form"
+      const altRow = Array.from(document.querySelectorAll("tr")).find((tr) => {
+        const firstTd = tr.querySelector("td");
+        if (!firstTd) return false;
+        const label = (firstTd.innerText || firstTd.textContent || "").toLowerCase();
+        return /item\s*form/.test(label);
+      });
+      if (altRow) {
+        const tds = altRow.querySelectorAll("td");
+        if (tds.length >= 2) {
+          const text = (tds[1].innerText || tds[1].textContent || "")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (text) return text;
+        }
+      }
+      // 3) Fallback: bullet or list: "Item Form: Lotion"
+      const li = Array.from(
+        document.querySelectorAll("#detailBullets_feature_div li, li")
+      ).find((el) => /item\s*form/i.test(el.innerText || el.textContent || ""));
+      if (li) {
+        const raw = (li.innerText || li.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+        const m = raw.match(/item\s*form\s*[:\-]?\s*(.+)$/i);
+        if (m && m[1]) return m[1].trim();
+      }
+      return "";
+    })();
+
+    // -------- Price (ensure currency) --------
+    const getPriceWithCurrency = () => {
+      const priceEl =
+        document.querySelector(".a-price .a-offscreen") ||
+        document.querySelector("#priceblock_ourprice, #priceblock_dealprice, #priceblock_saleprice");
+      let text = (priceEl?.textContent || "").trim();
+
+      const hasCurrency = /[\p{Sc}]|\b[A-Z]{3}\b/u.test(text);
+      if (text && !hasCurrency) {
+        const sym = document.querySelector(".a-price .a-price-symbol")?.textContent?.trim() || "";
+        if (sym) {
+          text = sym + text;
+        } else {
+          const iso =
+            document
+              .querySelector('meta[property="og:price:currency"]')
+              ?.getAttribute("content") || "";
+          if (iso) text = iso + " " + text;
+        }
+      }
+      return text || "";
+    };
+    const price = getPriceWithCurrency();
+
+    // -------- Featured bullets (each item prefixed with "• " and suffixed with " ") --------
+    const featuredBullets = (() => {
+      const items = Array.from(document.querySelectorAll("#feature-bullets ul li"))
+        .map((li) => (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean)
+        .map((text) => `• ${text} `);
+      return items.length ? items.join("") : "";
+    })();
+
+    // -------- Product Description --------
+    const productDescription = (() => {
+      const el = document.querySelector("#productDescription");
+      if (!el) return "";
+      return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+    })();
+
+    // -------- Images --------
+    const mainImageUrl = (() => {
+      const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
+      if (imgTag) return imgTag.getAttribute("src") || "";
+      return "";
+    })();
+
+    // Normalize thumbnail -> base jpg (do not force AC_SL here)
+    const normalizeImageUrl = (url) => {
+      if (!url) return "";
+      return url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg");
+    };
+    const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
+
+    // Collect candidate URLs from visible thumbs
+    let additionalImageUrls = Array.from(document.querySelectorAll("#altImages img, .imageThumb img"))
+      .map((img) => img.getAttribute("src") || "")
+      .map((src) => (src || "").trim())
+      .filter(Boolean);
+
+    // Also inspect landing image attributes
+    const landing = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
+    const fromLandingAttrs = [];
+    if (landing) {
+      const oldHires = landing.getAttribute("data-old-hires");
+      if (oldHires) fromLandingAttrs.push(oldHires);
+
+      const dyn = landing.getAttribute("data-a-dynamic-image");
+      if (dyn) {
+        try {
+          const clean = dyn.replace(/&quot;/g, '"');
+          const obj = JSON.parse(clean);
+          for (const k of Object.keys(obj || {})) fromLandingAttrs.push(k);
+        } catch {
+          try {
+            const clean2 = dyn
+              .replace(/&quot;/g, '"')
+              .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
+              .replace(/:\s*'([^']+?)'(\s*[},])/g, ':"$1"$2');
+            const obj2 = JSON.parse(clean2);
+            for (const k of Object.keys(obj2 || {})) fromLandingAttrs.push(k);
+          } catch {}
+        }
+      }
+    }
+
+    additionalImageUrls = [
+      ...additionalImageUrls,
+      ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
+    ];
+
+    // Scan entire document for hi-res URLs ending with ._AC_SL{digits}_.jpg
+    const hiResMatches = Array.from(
+      document.documentElement.innerHTML.matchAll(
+        /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi
+      )
+    ).map((m) => m[0]);
+
+    additionalImageUrls = [...new Set([...additionalImageUrls, ...hiResMatches])];
+
+    // Remove obvious junk thumbs/sprites/overlays
+    additionalImageUrls = additionalImageUrls.filter((src) => {
+      if (!src) return false;
+      const lower = src.toLowerCase();
+      return !(
+        lower.includes("sprite") ||
+        lower.includes("360_icon") ||
+        lower.includes("play-icon") ||
+        lower.includes("overlay") ||
+        lower.includes("fmjpg") ||
+        lower.includes("fmpng")
+      );
+    });
+
+    // Final pass: keep ANY _AC_SL{n}_ size, drop main
+    const AC_ANY = /\._AC_SL\d+_\.jpg(?:\?.*)?$/i;
+    additionalImageUrls = additionalImageUrls
+      .filter((url) => url && url !== normalizedMain)
+      .filter((url) => AC_ANY.test(url));
+
+    additionalImageUrls = [...new Set(additionalImageUrls)];
+
+    return {
+      title: (title || "").trim(),
+      itemForm: (itemForm || "").trim(),
+      price: (price || "").trim(),
+      featuredBullets: (featuredBullets || "").trim(),
+      productDescription: (productDescription || "").trim(),
+      mainImageUrl: normalizedMain || "",
+      additionalImageUrls,
+    };
+  }, title);
+}
+
+/**
+ * Gemini OCR extraction (Brand + Price with currency)
+ */
+async function geminiExtract(base64Image) {
+  const prompt = `
+You are given a screenshot of an Amazon product page.
+Extract JSON with exactly these keys:
+- brand: string (brand or manufacturer name)
+- price: string (include currency symbol or ISO code, e.g., "$12.99" or "USD 12.99")
+
+Rules:
+- Return ONLY valid minified JSON: {"brand":"...","price":"..."}
+- If a field is unknown or not visible, use "Unspecified".`;
+
+  const result = await model.generateContent([
+    { text: prompt },
+    { inlineData: { mimeType: "image/png", data: base64Image } },
+  ]);
+
+  let text = result.response.text().trim();
+  text = text.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
+
+  try {
+    const parsed = JSON.parse(text);
+    return {
+      brand: typeof parsed.brand === "string" ? parsed.brand.trim() : "Unspecified",
+      price: typeof parsed.price === "string" ? parsed.price.trim() : "Unspecified",
+    };
+  } catch {
+    return { brand: "Unspecified", price: "Unspecified" };
+  }
+}
+
+// ---------- endpoints ----------
+app.get("/", (req, res) => {
+  res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
+});
+
+function extractASINFromUrl(u = "") {
+  try {
+    const url = new URL(u);
+    const path = url.pathname;
+    const m1 = path.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = path.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
+  } catch {
+    const m1 = u.match(/\/dp\/([A-Z0-9]{8,10})/i);
+    const m2 = u.match(/\/gp\/product\/([A-Z0-9]{8,10})/i);
+    return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
+  }
+}
+
+function includesCurrency(s = "") {
+  return /[\p{Sc}]|\b[A-Z]{3}\b/u.test(s);
+}
+function currencyToken(s = "") {
+  const m = s.match(/([\p{Sc}]|\b[A-Z]{3}\b)/u);
+  return m ? m[1] : "";
+}
+
+/**
+ * Normalize Gemini price strings (fix superscripts, etc.)
+ */
+function normalizeGeminiPrice(raw = "", domPrice = "") {
+  let s = (raw || "").trim();
+  if (!s) return "Unspecified";
+
+  s = s.replace(/[\u00A0\u2009\u202F]/g, " ");
+
+  const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]/.test(s);
+
+  const map = {
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+  };
+  s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
+
+  if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) {
+    s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
+  }
+  if (!/\d\.\d{2,}/.test(s) && /(\d+)\s+(\d{2})\b/.test(s)) {
+    s = s.replace(/(\d+)\s+(\d{2})\b/, "$1.$2");
+  }
+
+  if (hadSuper && !/\d\.\d{2,}/.test(s)) {
+    const digits = (s.match(/\d+/g) || []).join("");
+    if (digits.length >= 3) {
+      const num = `${digits.slice(0, -2)}.${digits.slice(-2)}`;
+      const cur = currencyToken(s) || currencyToken(domPrice);
+      s = cur ? `${cur} ${num}` : num;
+    }
+  }
+
+  if (!includesCurrency(s) && includesCurrency(domPrice)) {
+    const cur = currencyToken(domPrice);
+    if (cur) s = `${cur} ${s}`;
+  }
+
+  s = s.replace(/\s+/g, " ").trim();
+  return s || "Unspecified";
+}
+
+app.get("/scrape", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ ok: false, error: "Missing url param" });
+
+  const width = 1280, height = 800;
+
+  let browser, context, page;
+  try {
+    const ctx = await minimalContext(width, height);
+    browser = ctx.browser;
+    context = ctx.context;
+    page = ctx.page;
+
+    // Hardened navigation with retry + CAPTCHA detection
+    await safeGoto(page, url, { retries: 2, timeout: 60000 });
+    ensureAlive(page, "Page unexpectedly closed after navigation");
+
+    // Dismiss/handle "Continue/Keep shopping"
+    page = await handleContinueShopping(page, context, url);
+    ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
+
+    // Product page or not? (retry if page closed)
+    let productLike;
+    try {
+      productLike = await isProductPage(page);
+    } catch (e) {
+      if (isClosedErr(e)) {
+        page = await adoptActivePageOrThrow(page, context);
+        await sleep(200);
+        productLike = await isProductPage(page);
+      } else {
+        throw e;
+      }
+    }
+
+    // If NOT a product page: capture screenshot, extract links/buttons, return.
+    if (!productLike) {
+      let bufNP;
+      try {
+        bufNP = await safeScreenshot(page, { type: "png" }, 1);
+      } catch (e) {
+        if (isClosedErr(e)) {
+          page = await adoptActivePageOrThrow(page, context);
+          bufNP = await safeScreenshot(page, { type: "png" }, 1);
+        } else {
+          throw e;
+        }
+      }
+      const base64NP = bufNP.toString("base64");
+      const meta = {
+        currentUrl: page.url(),
+        title: (await page.title().catch(() => "")) || "",
+      };
+      const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({
+        links: [],
+        buttons: [],
+        counts: { links: 0, buttons: 0 },
+      }));
+      return res.json({
+        ok: true,
+        url: meta.currentUrl,
+        pageType: "nonProduct",
+        screenshot: base64NP,
+        meta,
+        links,
+        buttons,
+        counts,
+      });
+    }
+
+    // Small pause to stabilize above-the-fold
+    await sleep(jitter(300, 400));
+
+    // Scrape Playwright data (retry if page closed mid-evaluate)
+    let scraped;
+    try {
+      scraped = await scrapeProductData(page);
+    } catch (e) {
+      if (isClosedErr(e)) {
+        page = await adoptActivePageOrThrow(page, context);
+        await sleep(200);
+        scraped = await scrapeProductData(page);
+      } else {
+        throw e;
+      }
+    }
+
+    ensureAlive(page, "Page closed before screenshot");
+
+    // Screenshot for OCR (with retry + adopt)
+    let buf;
+    try {
+      buf = await safeScreenshot(page, { type: "png" }, 1);
+    } catch (e) {
+      if (isClosedErr(e)) {
+        page = await adoptActivePageOrThrow(page, context);
+        buf = await safeScreenshot(page, { type: "png" }, 1);
+      } else {
+        throw e;
+      }
+    }
+    const base64 = buf.toString("base64");
+
+    // Gemini OCR for Brand + Price (with currency)
+    const gemini = await geminiExtract(base64);
+
+    // Normalize Gemini price
+    let priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
+
+    // ASIN from final resolved URL
+    const resolvedUrl = page.url() || url;
+    const asin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(url);
+
+    // Final JSON
+    res.json({
+      ok: true,
+      url: resolvedUrl,
+      pageType: "product",
+      ASIN: asin || "Unspecified",
+      title: scraped.title || "Unspecified",
+      brand: gemini.brand || "Unspecified",               // Gemini OCR
+      itemForm: scraped.itemForm || "Unspecified",        // Playwright (new logic)
+      price: scraped.price || "Unspecified",              // Playwright (currency ensured)
+      priceGemini: priceGemini || "Unspecified",          // Gemini OCR normalized
+      featuredBullets: scraped.featuredBullets || "Unspecified",
+      productDescription: scraped.productDescription || "Unspecified",
+      mainImageUrl: scraped.mainImageUrl || "Unspecified",
+      additionalImageUrls: scraped.additionalImageUrls || [],
+      screenshot: base64,                                  // base64 PNG
+    });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
+  } finally {
+    // Close all pages in context to avoid leaks if a popup was opened
+    try {
+      for (const p of context?.pages?.() || []) {
+        try {
+          if (!p.isClosed()) await p.close({ runBeforeUnload: false });
+        } catch {}
+      }
+    } catch {}
+    try {
+      await browser?.close();
+    } catch {}
+  }
+});
 
 // Start server
 app.listen(PORT, "0.0.0.0", () => {
