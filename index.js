@@ -132,6 +132,38 @@ function isLikelyDetourUrl(u = "") {
   );
 }
 
+// NEW helpers for frame-aware overlay handling
+function likelyAttachFrame(f) {
+  const name = (f.name() || "");
+  const url = (f.url() || "");
+  return /attach|sidesheet|hlb|add-to-cart|upsell/i.test(name) || /attach|sidesheet|hlb|add-to-cart|upsell/i.test(url);
+}
+function getAttachFrames(page) {
+  return page.frames().filter(likelyAttachFrame);
+}
+async function waitForOverlayToSettleOrTitle(page, timeout = 7000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    try {
+      const overlayGone = await page.evaluate(() => {
+        const q = (s) => document.querySelector(s);
+        return !(
+          q("#attach-close_sideSheet-link") ||
+          q("#attachAccessoryView") ||
+          q("#attach-desktop-sideSheet") ||
+          q('iframe[name*="attach"], iframe#attachSideSheet, iframe#attach-sidesheet-frame')
+        );
+      }).catch(() => false);
+
+      const titleBack = await hasProductTitle(page).catch(() => false);
+
+      if (overlayGone || titleBack) return true;
+    } catch {}
+    await sleep(150);
+  }
+  return false;
+}
+
 /* ---------------------------- Navigation helpers -------------------------- */
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let attempt = 0;
@@ -179,69 +211,6 @@ async function closeAttachSideSheetIfVisible(page) {
   }
 }
 
-// Click “Continue/Keep shopping” if present — calls onClick() when we actually click.
-async function clickContinueShoppingIfPresent(page, onClick) {
-  if (await closeAttachSideSheetIfVisible(page)) {
-    onClick?.();
-    return true;
-  }
-  const KNOWN_SELECTORS = [
-    '#hlb-continue-shopping-announce',
-    'a#hlb-continue-shopping-announce',
-    '#continue-shopping',
-    'button#continue-shopping',
-    'a[href*="continueShopping"]',
-    'button[name*="continueShopping"]',
-    'input[type="submit"][value*="Continue shopping" i]',
-    'input[type="submit"][value*="Keep shopping" i]',
-    'a:has-text("Keep shopping")',
-    'button:has-text("Keep shopping")',
-    '#attach-close_sideSheet-link',
-  ];
-  for (const sel of KNOWN_SELECTORS) {
-    try {
-      const el = page.locator(sel).first();
-      if (await el.isVisible({ timeout: 500 }).catch(() => false)) {
-        await el.click({ timeout: 2000 }).catch(() => {});
-        onClick?.();
-        return true;
-      }
-    } catch {}
-  }
-  try {
-    const textLoc = page.locator(
-      'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping"), button:has-text("Keep shopping"), a:has-text("Keep shopping")'
-    );
-    if (await textLoc.first().isVisible({ timeout: 500 }).catch(() => false)) {
-      await textLoc.first().click({ timeout: 2000 }).catch(() => {});
-      onClick?.();
-      return true;
-    }
-  } catch {}
-  try {
-    const clicked = await page.evaluate(() => {
-      const nodes = Array.from(
-        document.querySelectorAll('button, a, input[type="submit"], div[role="button"]')
-      );
-      const target = nodes.find((n) => {
-        const txt = ((n.innerText || n.value || "") + "").toLowerCase();
-        return txt.includes("continue shopping") || txt.includes("keep shopping");
-      });
-      if (target) {
-        target.scrollIntoView?.({ block: "center", inline: "center" });
-        target.click();
-        return true;
-      }
-      return false;
-    });
-    if (clicked) {
-      onClick?.();
-      return true;
-    }
-  } catch {}
-  return false;
-}
-
 async function hasProductTitle(page) {
   try {
     return await page.evaluate(() => {
@@ -252,21 +221,101 @@ async function hasProductTitle(page) {
   }
 }
 
-// EXACT request: click literal "text=Continue Shopping" up to maxTries; on each success, onClick()
+/* ---------------- Improved Continue Shopping logic (frame-aware) ---------- */
+// Click “Continue/Keep shopping” if present — calls onClick() when we actually click.
+async function clickContinueShoppingIfPresent(page, onClick) {
+  // 1) explicit close in main frame
+  if (await closeAttachSideSheetIfVisible(page)) {
+    onClick?.();
+    await waitForOverlayToSettleOrTitle(page, 5000);
+    return true;
+  }
+
+  // candidates in main frame
+  const pageCandidates = [
+    page.getByRole('button', { name: /continue shopping|keep shopping/i }),
+    page.getByRole('link',   { name: /continue shopping|keep shopping/i }),
+    page.locator('#hlb-continue-shopping-announce'),
+    page.locator('#continue-shopping'),
+    page.locator('a#hlb-continue-shopping-announce'),
+    page.locator('#attach-close_sideSheet-link'),
+    page.locator('input[type="submit"]').filter({ hasText: /continue shopping|keep shopping/i }),
+    page.locator('button, a, input[type="submit"], [role="button"]').filter({ hasText: /continue shopping|keep shopping/i }),
+  ];
+
+  // candidates in attach/HLB iframes
+  const frameCandidates = [];
+  for (const f of getAttachFrames(page)) {
+    frameCandidates.push(
+      f.getByRole('button', { name: /continue shopping|keep shopping/i }),
+      f.getByRole('link',   { name: /continue shopping|keep shopping/i }),
+      f.locator('#hlb-continue-shopping-announce'),
+      f.locator('#attach-close_sideSheet-link'),
+      f.locator('button, a, input[type="submit"], [role="button"]').filter({ hasText: /continue shopping|keep shopping/i }),
+    );
+  }
+
+  const tryClick = async (loc) => {
+    try {
+      if (await loc.isVisible({ timeout: 400 }).catch(() => false)) {
+        try { await loc.scrollIntoViewIfNeeded({ timeout: 500 }); } catch {}
+        await loc.click({ timeout: 1500 }).catch(() => {});
+        onClick?.();
+        await waitForOverlayToSettleOrTitle(page, 5000);
+        return true;
+      }
+    } catch {}
+    return false;
+  };
+
+  for (const loc of [...pageCandidates, ...frameCandidates]) {
+    if (await tryClick(loc)) return true;
+  }
+
+  // Soft fallback: Esc can dismiss side-sheet
+  try { await page.keyboard.press('Escape'); } catch {}
+  if (await waitForOverlayToSettleOrTitle(page, 2500)) {
+    onClick?.();
+    return true;
+  }
+
+  return false;
+}
+
+// EXACT request: click literal "Continue/Keep shopping" up to maxTries; on each success, onClick()
 async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
   for (let i = 0; i < maxTries; i++) {
     let clicked = false;
-    try {
-      await page.click("text=Continue Shopping", { timeout: 1500 });
+
+    const t = page.getByText(/continue shopping|keep shopping/i).first();
+    if (await t.isVisible({ timeout: 600 }).catch(() => false)) {
+      await t.click({ timeout: 1500 }).catch(() => {});
       clicked = true;
       onClick?.();
-    } catch {}
+    } else {
+      for (const f of getAttachFrames(page)) {
+        const ft = f.getByText(/continue shopping|keep shopping/i).first();
+        if (await ft.isVisible({ timeout: 400 }).catch(() => false)) {
+          await ft.click({ timeout: 1500 }).catch(() => {});
+          clicked = true;
+          onClick?.();
+          break;
+        }
+      }
+    }
+
     await Promise.race([
-      page.waitForNavigation({ waitUntil: "commit", timeout: 4000 }).catch(() => null),
-      page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => null),
+      page.waitForNavigation({ waitUntil: "commit", timeout: 3000 }).catch(() => null),
+      page.waitForLoadState("domcontentloaded", { timeout: 3000 }).catch(() => null),
+      waitForOverlayToSettleOrTitle(page, 3000),
     ]);
+
     if (await hasProductTitle(page)) return true;
-    if (!clicked) await sleep(350);
+
+    if (!clicked) {
+      try { await page.keyboard.press('Escape'); } catch {}
+      await sleep(300);
+    }
   }
   return false;
 }
@@ -276,18 +325,17 @@ async function handleContinueShopping(page, context, fallbackUrl, onClick) {
     const clicked = await clickContinueShoppingIfPresent(page, onClick);
     if (!clicked) return page;
 
-    const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
-    const navPromise = page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }).catch(() => null);
-    const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => null);
-    await Promise.race([popupPromise, navPromise, dclPromise]);
+    const popupPromise  = context.waitForEvent("page", { timeout: 6000 }).catch(() => null);
+    const navPromise    = page.waitForNavigation({ timeout: 10000, waitUntil: "commit" }).catch(() => null);
+    const dclPromise    = page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => null);
+    const settlePromise = waitForOverlayToSettleOrTitle(page, 5000);
+    await Promise.race([popupPromise, navPromise, dclPromise, settlePromise]);
 
-    const pages = context.pages();
-    const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
-    if (active && active !== page) {
+    const active = context.pages().find((p) => !p.isClosed() && p.url() !== "about:blank");
+    if (active) {
       try { await active.bringToFront(); } catch {}
       return active;
     }
-    if (page && !page.isClosed()) return page;
 
     const fresh = await context.newPage();
     try { await fresh.bringToFront(); } catch {}
@@ -304,128 +352,6 @@ async function handleContinueShopping(page, context, fallbackUrl, onClick) {
       return fresh;
     }
   }
-}
-
-async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
-  let lastErr;
-  for (let i = 0; i <= retries; i++) {
-    ensureAlive(page, "Page closed before screenshot");
-    try {
-      return await page.screenshot(opts);
-    } catch (err) {
-      lastErr = err;
-      const msg = (err && err.message) || String(err);
-      if (/Target page, context or browser has been closed/i.test(msg)) {
-        throw new Error("Screenshot failed: " + msg);
-      }
-      if (i < retries) {
-        await sleep(jitter(250, 500));
-        continue;
-      }
-      throw new Error("Screenshot failed: " + msg);
-    }
-  }
-  throw lastErr || new Error("Screenshot failed");
-}
-
-async function isProductPage(page) {
-  try {
-    return await page.evaluate(() => {
-      const url = location.href;
-      const canonical = document.querySelector('link[rel="canonical"]')?.href || "";
-      const urlFlag =
-        /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(url) ||
-        /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(canonical);
-
-      const hasTitle =
-        !!document.querySelector("#productTitle") ||
-        !!document.querySelector("#titleSection #title");
-      const hasByline = !!document.querySelector("#bylineInfo");
-      const hasBuyCtas =
-        !!document.querySelector("#add-to-cart-button, input#add-to-cart-button") ||
-        !!document.querySelector("#buy-now-button, input#buy-now-button");
-
-      const layoutHints = !!document.querySelector("#dp, #dp-container, #ppd, #centerCol, #leftCol");
-
-      return (urlFlag && hasTitle && layoutHints) || ((hasTitle || hasByline) && hasBuyCtas);
-    });
-  } catch {
-    return false;
-  }
-}
-
-async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
-  return await page.evaluate((limits) => {
-    const toAbs = (u) => {
-      try {
-        return u ? new URL(u, location.href).href : "";
-      } catch {
-        return u || "";
-      }
-    };
-    const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
-
-    const linkNodes = Array.from(document.querySelectorAll("a"));
-    const btnNodes = Array.from(
-      document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]')
-    );
-
-    const links = linkNodes.slice(0, limits.maxLinks).map((el) => ({
-      tag: "a",
-      text: clean(el.innerText || el.textContent || ""),
-      href: toAbs(el.getAttribute("href")),
-      id: el.id || "",
-      classes: clean(el.className || ""),
-      rel: el.getAttribute("rel") || "",
-      target: el.getAttribute("target") || "",
-      role: el.getAttribute("role") || "",
-      ariaLabel: el.getAttribute("aria-label") || "",
-      onclick: el.getAttribute("onclick") || "",
-    }));
-
-    const buttons = btnNodes.slice(0, limits.maxButtons).map((el) => {
-      const tag = (el.tagName || "").toLowerCase();
-      return {
-        tag,
-        text: clean(el.innerText || el.value || el.textContent || ""),
-        id: el.id || "",
-        classes: clean(el.className || ""),
-        name: el.getAttribute("name") || "",
-        type: el.getAttribute("type") || "",
-        role: el.getAttribute("role") || "",
-        ariaLabel: el.getAttribute("aria-label") || "",
-        onclick: el.getAttribute("onclick") || "",
-        href:
-          tag === "a"
-            ? toAbs(el.getAttribute("href"))
-            : el.getAttribute("href")
-            ? toAbs(el.getAttribute("href"))
-            : "",
-      };
-    });
-
-    // de-dupe
-    const seenL = new Set();
-    const dedupLinks = [];
-    for (const l of links) {
-      const k = `${l.href}|${l.text}`;
-      if (l.href && !seenL.has(k)) {
-        seenL.add(k);
-        dedupLinks.push(l);
-      }
-    }
-    const seenB = new Set();
-    const dedupButtons = [];
-    for (const b of buttons) {
-      const k = `${b.text}|${b.id}`;
-      if (!seenB.has(k)) {
-        seenB.add(k);
-        dedupButtons.push(b);
-      }
-    }
-
-    return { links: dedupLinks, buttons: dedupButtons, counts: { links: links.length, buttons: buttons.length } };
-  }, limits);
 }
 
 /* ------------------------------ Product scrape ---------------------------- */
@@ -794,6 +720,129 @@ app.get("/scrape", async (req, res) => {
     try { await browser?.close(); } catch {}
   }
 });
+
+/* ------------------------------- Utilities -------------------------------- */
+async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    ensureAlive(page, "Page closed before screenshot");
+    try {
+      return await page.screenshot(opts);
+    } catch (err) {
+      lastErr = err;
+      const msg = (err && err.message) || String(err);
+      if (/Target page, context or browser has been closed/i.test(msg)) {
+        throw new Error("Screenshot failed: " + msg);
+      }
+      if (i < retries) {
+        await sleep(jitter(250, 500));
+        continue;
+      }
+      throw new Error("Screenshot failed: " + msg);
+    }
+  }
+  throw lastErr || new Error("Screenshot failed");
+}
+
+async function isProductPage(page) {
+  try {
+    return await page.evaluate(() => {
+      const url = location.href;
+      const canonical = document.querySelector('link[rel="canonical"]')?.href || "";
+      const urlFlag =
+        /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(url) ||
+        /\/dp\/[A-Z0-9]{8,}|\b\/gp\/product\/[A-Z0-9]{8,}/i.test(canonical);
+
+      const hasTitle =
+        !!document.querySelector("#productTitle") ||
+        !!document.querySelector("#titleSection #title");
+      const hasByline = !!document.querySelector("#bylineInfo");
+      const hasBuyCtas =
+        !!document.querySelector("#add-to-cart-button, input#add-to-cart-button") ||
+        !!document.querySelector("#buy-now-button, input#buy-now-button");
+
+      const layoutHints = !!document.querySelector("#dp, #dp-container, #ppd, #centerCol, #leftCol");
+
+      return (urlFlag && hasTitle && layoutHints) || ((hasTitle || hasByline) && hasBuyCtas);
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
+  return await page.evaluate((limits) => {
+    const toAbs = (u) => {
+      try {
+        return u ? new URL(u, location.href).href : "";
+      } catch {
+        return u || "";
+      }
+    };
+    const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+
+    const linkNodes = Array.from(document.querySelectorAll("a"));
+    const btnNodes = Array.from(
+      document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]')
+    );
+
+    const links = linkNodes.slice(0, limits.maxLinks).map((el) => ({
+      tag: "a",
+      text: clean(el.innerText || el.textContent || ""),
+      href: toAbs(el.getAttribute("href")),
+      id: el.id || "",
+      classes: clean(el.className || ""),
+      rel: el.getAttribute("rel") || "",
+      target: el.getAttribute("target") || "",
+      role: el.getAttribute("role") || "",
+      ariaLabel: el.getAttribute("aria-label") || "",
+      onclick: el.getAttribute("onclick") || "",
+    }));
+
+    const buttons = btnNodes.slice(0, limits.maxButtons).map((el) => {
+      const tag = (el.tagName || "").toLowerCase();
+      return {
+        tag,
+        text: clean(el.innerText || el.value || el.textContent || ""),
+        id: el.id || "",
+        classes: clean(el.className || ""),
+        name: el.getAttribute("name") || "",
+        type: el.getAttribute("type") || "",
+        role: el.getAttribute("role") || "",
+        ariaLabel: el.getAttribute("aria-label") || "",
+        onclick: el.getAttribute("onclick") || "",
+        href:
+          tag === "a"
+            ? toAbs(el.getAttribute("href"))
+            : el.getAttribute("href")
+            ? toAbs(el.getAttribute("href"))
+            : "",
+      };
+    });
+
+    // de-dupe
+    const seenL = new Set();
+    const dedupLinks = [];
+    for (const l of links) {
+      const k = `${l.href}|${l.text}`;
+      if (l.href && !seenL.has(k)) {
+        seenL.add(k);
+        dedupLinks.push(l);
+      }
+    }
+    const seenB = new Set();
+    const dedupButtons = [];
+    for (const b of buttons) {
+      const k = `${b.text}|${b.id}`;
+      if (!seenB.has(k)) {
+        seenB.add(k);
+        dedupButtons.push(b);
+      }
+    }
+
+    return { links: dedupLinks, buttons: dedupButtons, counts: { links: links.length, buttons: buttons.length } };
+  }, limits);
+}
 
 // Start server
 app.listen(PORT, "0.0.0.0", () => {
