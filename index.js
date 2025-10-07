@@ -179,7 +179,7 @@ async function closeAttachSideSheetIfVisible(page) {
   }
 }
 
-// Detect & click "Continue/Keep shopping" if present (in overlays or inline)
+// Detect & click "Continue/Keep shopping" if present (overlays or inline)
 async function clickContinueShoppingIfPresent(page) {
   if (await closeAttachSideSheetIfVisible(page)) {
     return true;
@@ -440,30 +440,47 @@ async function scrapeProductData(page) {
     const rating = (() => {
       const el = document.querySelector("#acrPopover");
       const titleAttr = el?.getAttribute("title") || "";
-      // e.g., "4.7 out of 5 stars" => "4.7"
       const cleaned = titleAttr.replace(/out of 5 stars/i, "").replace(/\s+/g, " ").trim();
       return cleaned || "";
     })();
 
-    /* -------- Date First Available (detail bullets) -------- */
+    /* -------- Date First Available (detail bullets) — return ONLY the date -------- */
     const dateFirstAvailable = (() => {
       const container = document.querySelector("#detailBullets_feature_div");
       if (!container) return "";
-      // Find the <li> where the bold span contains “Date First Available”
       const li = Array.from(container.querySelectorAll("li")).find((node) => {
         const label = (node.querySelector("span.a-text-bold")?.innerText || node.innerText || node.textContent || "");
         return /date\s*first\s*available/i.test(label);
       });
       if (!li) return "";
-      // The next <span> (sibling) contains the date in many pages
-      const textSpans = Array.from(li.querySelectorAll("span")).map((s) => (s.innerText || s.textContent || "").trim()).filter(Boolean);
-      // Typically something like ["Date First Available : ", "September 7, 2017"]
-      const candidate = textSpans.find((s) => /\w+\s+\d{1,2},\s+\d{4}/.test(s));
-      if (candidate) return candidate;
-      // Fallback: clean the whole line and try to extract trailing date
+
+      const DATE_RE = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}\b/;
+
+      // 1) Ideal case: bold label span → take its next sibling span’s text
+      const bold = li.querySelector("span.a-text-bold");
+      if (bold) {
+        let sib = bold.nextElementSibling;
+        // skip RTL/LRM text nodes packaged in spans that are just punctuation
+        while (sib && sib.tagName?.toLowerCase() === "span" && !DATE_RE.test(sib.textContent || "")) {
+          sib = sib.nextElementSibling;
+        }
+        const val = (sib && sib.textContent) ? sib.textContent.trim() : "";
+        const m = val.match(DATE_RE);
+        if (m) return m[0];
+      }
+
+      // 2) Fallback: look at all non-bold spans inside this <li>
+      const spans = Array.from(li.querySelectorAll("span")).filter((s) => !s.classList.contains("a-text-bold"));
+      for (const s of spans) {
+        const t = (s.innerText || s.textContent || "").trim();
+        const m = t.match(DATE_RE);
+        if (m) return m[0];
+      }
+
+      // 3) Final fallback: extract from the whole <li> text
       const full = (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim();
-      const m = full.match(/date\s*first\s*available.*?(\b\w+\s+\d{1,2},\s+\d{4}\b)/i);
-      return (m && m[1]) || "";
+      const m = full.match(DATE_RE);
+      return (m && m[0]) || "";
     })();
 
     /* -------- Release date fallback (prodDetails table) -------- */
@@ -478,8 +495,7 @@ async function scrapeProductData(page) {
         const label = (th.innerText || th.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
         if (/release\s*date|date\s*released|date\s*of\s*release/i.test(label)) {
           const val = (td.innerText || td.textContent || "").replace(/\s+/g, " ").trim();
-          // Prefer a yyyy-style date shape if present
-          const m = val.match(/\b\w+\s+\d{1,2},\s+\d{4}\b/);
+          const m = val.match(/\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}\b/);
           return (m && m[0]) || val;
         }
       }
@@ -495,21 +511,17 @@ async function scrapeProductData(page) {
     const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
-    /* -------- Additional Images (ONLY from ImageBlockATF scripts, _AC_SL only) -------- */
+    /* -------- Additional Images: ONLY from ImageBlockATF scripts, _AC_SL only -------- */
     const additionalImageUrls = (() => {
       const AC_SL = /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi;
       const scripts = Array.from(document.querySelectorAll("script"));
       const urls = new Set();
       for (const s of scripts) {
         const txt = s.textContent || "";
-        // Only consider the ATF image block script
         if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
-        // Pull only _AC_SL… hires URLs from this script’s text
         const matches = txt.match(AC_SL) || [];
         for (const m of matches) {
-          // strip query strings for stability
           const clean = m.split("?")[0];
-          // avoid duplicating main image (normalized) if it happens to be AC_SL (usually it's SX/SY)
           if (clean && clean !== normalizedMain) urls.add(clean);
         }
       }
@@ -616,7 +628,6 @@ app.get("/scrape", async (req, res) => {
   const returnUrl = intendedDpUrl || inputUrl;
 
   let browser, context, page;
-  // detour bounce tracking
   let detourBounceAttempts = 0;
   const MAX_DETOUR_BOUNCES = 3;
 
@@ -630,17 +641,16 @@ app.get("/scrape", async (req, res) => {
     await safeGoto(page, inputUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // If detoured, bounce back to intended /dp/ASIN up to 3 times with a short settle delay
+    // Bounce back to dp if detoured (with small settle delay)
     const bounceBackToDp = async () => {
       if (!intendedDpUrl) return;
       for (let i = 0; i < MAX_DETOUR_BOUNCES; i++) {
-        await sleep(300); // let URL stabilize (avoids counting transient navs)
+        await sleep(300);
         const curUrl = page.url();
-        if (isDpUrl(curUrl)) break; // already on dp
+        if (isDpUrl(curUrl)) break;
         if (isLikelyDetourUrl(curUrl) || !isDpUrl(curUrl)) {
           detourBounceAttempts++;
           await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
-          // handle continue shopping after bounce
           page = await handleContinueShopping(page, context, intendedDpUrl, null);
           if (await hasProductTitle(page)) break;
         } else {
@@ -650,7 +660,7 @@ app.get("/scrape", async (req, res) => {
     };
     await bounceBackToDp();
 
-    // If we are on /dp/ but no title yet, simple fallback click
+    // If on /dp/ but no title yet, simple fallback
     if (isDpUrl(page.url()) && !(await hasProductTitle(page))) {
       await trySimpleContinueShoppingFallback(page, 3, null);
     }
@@ -658,7 +668,6 @@ app.get("/scrape", async (req, res) => {
     // Final product check; if not product after bounces, return nonProduct JSON
     let productLike = await isProductPage(page);
     if (!productLike) {
-      // One last try: if we know intended dp, attempt a final bounce
       if (intendedDpUrl && detourBounceAttempts < MAX_DETOUR_BOUNCES) {
         detourBounceAttempts++;
         await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
@@ -667,7 +676,6 @@ app.get("/scrape", async (req, res) => {
       }
     }
 
-    // If still non-product, return nonProduct JSON quickly
     if (!productLike) {
       let bufNP;
       try {
@@ -690,7 +698,7 @@ app.get("/scrape", async (req, res) => {
       });
     }
 
-    // From here we are on product-like; deal with any inline/overlay “continue shopping” loops
+    // Handle any “continue shopping” loops inline
     for (let i = 0; i < 3; i++) {
       const before = page.url();
       const handled = await clickContinueShoppingIfPresent(page);
@@ -704,7 +712,6 @@ app.get("/scrape", async (req, res) => {
       if (after === before) await sleep(350);
     }
 
-    // Small pause to stabilize above-the-fold
     await sleep(jitter(300, 400));
 
     // Scrape DOM
@@ -744,7 +751,7 @@ app.get("/scrape", async (req, res) => {
     const resolvedUrl = page.url() || returnUrl;
     const finalAsin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(inputUrl);
 
-    // Final JSON (structure unchanged except new fields already introduced earlier)
+    // Final JSON
     res.json({
       ok: true,
       url: resolvedUrl,
