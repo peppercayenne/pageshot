@@ -485,7 +485,13 @@ async function scrapeProductData(page) {
     })();
 
     // -------- Images + EXPERIMENTAL counts by source --------
-    const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
+    // Preserve Amazon size tokens; only strip query strings
+    const normalizeImageUrl = (url) => {
+      if (!url) return "";
+      const noQuery = url.split("?")[0];
+      return noQuery.trim();
+    };
+
     const mainImageUrl = (() => {
       const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
       if (imgTag) return imgTag.getAttribute("src") || "";
@@ -535,7 +541,7 @@ async function scrapeProductData(page) {
 
     // Filter/normalize the three sources the same way
     const isJunk = (src) => {
-      const lower = src.toLowerCase();
+      const lower = (src || "").toLowerCase();
       return (
         !src ||
         src === normalizedMain ||
@@ -833,10 +839,9 @@ app.get("/scrape", async (req, res) => {
       detourBounceAttempts++;
       await safeGoto(page, targetUrl, { retries: 1, timeout: 60000 });
       await sleep(jitter(250, 350));
-      // If still detoured after next iteration, loop continues (up to 3)
     }
 
-    // 3) If we are on product (or /dp/), handle continue-shopping up to 3 dismissals until product looks ready
+    // 3) Continue-shopping handling up to 3 dismissals until product looks ready
     for (let i = 0; i < 3; i++) {
       const { page: p2, dismissed } = await handleContinueShopping(page, context, targetUrl);
       page = p2;
@@ -887,7 +892,7 @@ app.get("/scrape", async (req, res) => {
         ok: true,
         url: meta.currentUrl,
         pageType: "nonProduct",
-        detourBounceAttempts,              // keep this surfaced for debugging
+        detourBounceAttempts,              // debugging
         continueShoppingDismissals,        // number of times we clicked/dismissed
         screenshot: base64NP,
         meta,
