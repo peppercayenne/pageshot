@@ -55,9 +55,7 @@ async function minimalContext(width, height) {
     Object.defineProperty(navigator, "webdriver", { get: () => false });
   });
 
-  await page.setExtraHTTPHeaders({
-    "accept-language": "en-US,en;q=0.9",
-  });
+  await page.setExtraHTTPHeaders({ "accept-language": "en-US,en;q=0.9" });
 
   return { browser, context, page };
 }
@@ -100,7 +98,8 @@ function extractASINFromUrl(u = "") {
     return (m1?.[1] || m2?.[1] || "").toUpperCase() || "";
   }
 }
-const isDpUrl = (u = "") => /\/dp\/[A-Z0-9]{8,10}/i.test(u) || /\/gp\/product\/[A-Z0-9]{8,10}/i.test(u);
+const isDpUrl = (u = "") => /\/dp\/[A-Z0-9]{8,10}/i.test(u);
+const buildDpUrl = (asin) => (asin ? `https://www.amazon.com/dp/${asin}` : "");
 
 function isRobotCheckUrl(url) {
   if (!url) return false;
@@ -114,23 +113,29 @@ async function looksBlocked(page) {
   try {
     const url = page.url();
     if (isRobotCheckUrl(url)) return true;
-
     const title = (await page.title().catch(() => "")) || "";
     if (/robot check/i.test(title) || /captcha/i.test(title)) return true;
-
     const bodyText = await page.evaluate(() => document.body?.innerText || "");
-    if (/enter the characters|type the characters|sorry/i.test(bodyText)) {
-      return true;
-    }
+    if (/enter the characters|type the characters|sorry/i.test(bodyText)) return true;
   } catch {}
   return false;
+}
+function isLikelyDetourUrl(u = "") {
+  return (
+    /\/hz\/mobile\/mission/i.test(u) ||
+    /\/ap\/signin/i.test(u) ||
+    /\/gp\/help/i.test(u) ||
+    /\/gp\/navigation/i.test(u) ||
+    /\/customer-preferences/i.test(u) ||
+    /\/gp\/yourstore/i.test(u) ||
+    /\/gp\/history/i.test(u)
+  );
 }
 
 /* ---------------------------- Navigation helpers -------------------------- */
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let attempt = 0;
   let lastErr;
-
   while (attempt <= retries) {
     try {
       await sleep(jitter(250, 500));
@@ -148,7 +153,6 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   throw lastErr || new Error("Navigation failed");
 }
 
-/* -------- Continue Shopping / Side-sheet handling (body + popovers) ------- */
 async function closeAttachSideSheetIfVisible(page) {
   try {
     const closed = await page.evaluate(() => {
@@ -175,9 +179,11 @@ async function closeAttachSideSheetIfVisible(page) {
   }
 }
 
+// Detect & click "Continue/Keep shopping" if present (in overlays or inline)
 async function clickContinueShoppingIfPresent(page) {
-  if (await closeAttachSideSheetIfVisible(page)) return true;
-
+  if (await closeAttachSideSheetIfVisible(page)) {
+    return true;
+  }
   const KNOWN_SELECTORS = [
     '#hlb-continue-shopping-announce',
     'a#hlb-continue-shopping-announce',
@@ -190,11 +196,7 @@ async function clickContinueShoppingIfPresent(page) {
     'a:has-text("Keep shopping")',
     'button:has-text("Keep shopping")',
     '#attach-close_sideSheet-link',
-    // Body-level confirmers seen after add-to-cart
-    'button:has-text("Continue shopping")',
-    'a:has-text("Continue shopping")',
   ];
-
   for (const sel of KNOWN_SELECTORS) {
     try {
       const el = page.locator(sel).first();
@@ -204,7 +206,6 @@ async function clickContinueShoppingIfPresent(page) {
       }
     } catch {}
   }
-
   try {
     const textLoc = page.locator(
       'button:has-text("Continue shopping"), a:has-text("Continue shopping"), [role="button"]:has-text("Continue shopping"), button:has-text("Keep shopping"), a:has-text("Keep shopping")'
@@ -214,7 +215,6 @@ async function clickContinueShoppingIfPresent(page) {
       return true;
     }
   } catch {}
-
   try {
     const clicked = await page.evaluate(() => {
       const nodes = Array.from(
@@ -233,48 +233,73 @@ async function clickContinueShoppingIfPresent(page) {
     });
     if (clicked) return true;
   } catch {}
-
   return false;
 }
 
-async function handleContinueShopping(page, context, fallbackUrl) {
+async function hasProductTitle(page) {
+  try {
+    return await page.evaluate(() => {
+      return !!(document.querySelector("#productTitle") || document.querySelector("#title"));
+    });
+  } catch {
+    return false;
+  }
+}
+
+// EXACT request fallback: click literal "Continue Shopping" up to maxTries
+async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
+  for (let i = 0; i < maxTries; i++) {
+    let clicked = false;
+    try {
+      await page.click("text=Continue Shopping", { timeout: 1500 });
+      clicked = true;
+      onClick?.();
+    } catch {}
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "commit", timeout: 4000 }).catch(() => null),
+      page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => null),
+    ]);
+    if (await hasProductTitle(page)) return true;
+    if (!clicked) await sleep(350);
+  }
+  return false;
+}
+
+async function handleContinueShopping(page, context, fallbackUrl, onClick) {
   try {
     const clicked = await clickContinueShoppingIfPresent(page);
-    if (!clicked) return { page, dismissed: false };
+    if (!clicked) return page;
 
     const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
     const navPromise = page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }).catch(() => null);
     const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => null);
-
     await Promise.race([popupPromise, navPromise, dclPromise]);
 
     const pages = context.pages();
     const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
     if (active && active !== page) {
       try { await active.bringToFront(); } catch {}
-      return { page: active, dismissed: true };
+      return active;
     }
-
-    if (page && !page.isClosed()) return { page, dismissed: true };
+    if (page && !page.isClosed()) return page;
 
     const fresh = await context.newPage();
     try { await fresh.bringToFront(); } catch {}
     if (fallbackUrl) await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
-    return { page: fresh, dismissed: true };
+    return fresh;
   } catch {
     try {
       const adopted = await adoptActivePageOrThrow(page, context);
-      return { page: adopted, dismissed: true };
+      return adopted;
     } catch {
       const fresh = await context.newPage();
       try { await fresh.bringToFront(); } catch {}
       if (fallbackUrl) await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
-      return { page: fresh, dismissed: true };
+      return fresh;
     }
   }
 }
 
-/* -------------------------------- Screenshot ------------------------------- */
 async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
   let lastErr;
   for (let i = 0; i <= retries; i++) {
@@ -297,7 +322,6 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
   throw lastErr || new Error("Screenshot failed");
 }
 
-/* --------------------------- Product page heuristic ------------------------ */
 async function isProductPage(page) {
   try {
     return await page.evaluate(() => {
@@ -324,96 +348,14 @@ async function isProductPage(page) {
   }
 }
 
-/* ---------------------------- Non-product extraction ----------------------- */
-async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons: 300 }) {
-  return await page.evaluate((limits) => {
-    const toAbs = (u) => {
-      try {
-        return u ? new URL(u, location.href).href : "";
-      } catch {
-        return u || "";
-      }
-    };
-    const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
-
-    const linkNodes = Array.from(document.querySelectorAll("a"));
-    const btnNodes = Array.from(
-      document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]')
-    );
-
-    const links = linkNodes.slice(0, limits.maxLinks).map((el) => ({
-      tag: "a",
-      text: clean(el.innerText || el.textContent || ""),
-      href: toAbs(el.getAttribute("href")),
-      id: el.id || "",
-      classes: clean(el.className || ""),
-      rel: el.getAttribute("rel") || "",
-      target: el.getAttribute("target") || "",
-      role: el.getAttribute("role") || "",
-      ariaLabel: el.getAttribute("aria-label") || "",
-      onclick: el.getAttribute("onclick") || "",
-    }));
-
-    const buttons = btnNodes.slice(0, limits.maxButtons).map((el) => {
-      const tag = (el.tagName || "").toLowerCase();
-      return {
-        tag,
-        text: clean(el.innerText || el.value || el.textContent || ""),
-        id: el.id || "",
-        classes: clean(el.className || ""),
-        name: el.getAttribute("name") || "",
-        type: el.getAttribute("type") || "",
-        role: el.getAttribute("role") || "",
-        ariaLabel: el.getAttribute("aria-label") || "",
-        onclick: el.getAttribute("onclick") || "",
-        href:
-          tag === "a"
-            ? toAbs(el.getAttribute("href"))
-            : el.getAttribute("href")
-            ? toAbs(el.getAttribute("href"))
-            : "",
-      };
-    });
-
-    // de-dupe
-    const seenL = new Set();
-    const dedupLinks = [];
-    for (const l of links) {
-      const k = `${l.href}|${l.text}`;
-      if (l.href && !seenL.has(k)) {
-        seenL.add(k);
-        dedupLinks.push(l);
-      }
-    }
-    const seenB = new Set();
-    const dedupButtons = [];
-    for (const b of buttons) {
-      const k = `${b.text}|${b.id}`;
-      if (!seenB.has(k)) {
-        seenB.add(k);
-        dedupButtons.push(b);
-      }
-    }
-
-    return { links: dedupLinks, buttons: dedupButtons, counts: { links: links.length, buttons: buttons.length } };
-  }, limits);
-}
-
-/* ------------------------------- DOM scraping ------------------------------ */
-/**
- * Scrape product data (DOM-only fields) + imageSourceCounts + selectedOldHiresACSL
- */
+/* ------------------------------ Product scrape ---------------------------- */
 async function scrapeProductData(page) {
   const title =
     (await page.textContent("#productTitle").catch(() => null)) ||
     (await page.textContent("#title").catch(() => null));
 
   return await page.evaluate((title) => {
-    const cleanSpaces = (s) => (s || "").replace(/\s+/g, " ").trim();
-    const stripMarks = (s) => (s || "").replace(/[\u200E\u200F\u061C]/g, "");
-    const cleanText = (s) => cleanSpaces(stripMarks(s));
-
-    // -------- Item Form --------
+    /* -------- Item Form -------- */
     const itemForm = (() => {
       const row =
         document.querySelector("tr.po-item_form") ||
@@ -421,7 +363,8 @@ async function scrapeProductData(page) {
       if (row) {
         const tds = row.querySelectorAll("td");
         if (tds.length >= 2) {
-          const text = cleanSpaces(tds[1].innerText || tds[1].textContent || "");
+          const text = (tds[1].innerText || tds[1].textContent || "")
+            .replace(/\s+/g, " ").trim();
           if (text) return text;
         }
       }
@@ -434,7 +377,8 @@ async function scrapeProductData(page) {
       if (altRow) {
         const tds = altRow.querySelectorAll("td");
         if (tds.length >= 2) {
-          const text = cleanSpaces(tds[1].innerText || tds[1].textContent || "");
+          const text = (tds[1].innerText || tds[1].textContent || "")
+            .replace(/\s+/g, " ").trim();
           if (text) return text;
         }
       }
@@ -442,14 +386,15 @@ async function scrapeProductData(page) {
         document.querySelectorAll("#detailBullets_feature_div li, li")
       ).find((el) => /item\s*form/i.test(el.innerText || el.textContent || ""));
       if (li) {
-        const raw = cleanSpaces(li.innerText || li.textContent || "");
+        const raw = (li.innerText || li.textContent || "")
+          .replace(/\s+/g, " ").trim();
         const m = raw.match(/item\s*form\s*[:\-]?\s*(.+)$/i);
-        if (m && m[1]) return cleanSpaces(m[1]);
+        if (m && m[1]) return m[1].trim();
       }
       return "";
     })();
 
-    // -------- Price (ensure currency) --------
+    /* -------- Price (ensure currency) -------- */
     const getPriceWithCurrency = () => {
       const priceEl =
         document.querySelector(".a-price .a-offscreen") ||
@@ -468,23 +413,80 @@ async function scrapeProductData(page) {
     };
     const price = getPriceWithCurrency();
 
-    // -------- Featured bullets --------
+    /* -------- Featured bullets -------- */
     const featuredBullets = (() => {
       const items = Array.from(document.querySelectorAll("#feature-bullets ul li"))
-        .map((li) => cleanSpaces(li.innerText || li.textContent || ""))
+        .map((li) => (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim())
         .filter(Boolean)
         .map((text) => `• ${text} `);
       return items.length ? items.join("") : "";
     })();
 
-    // -------- Product Description --------
+    /* -------- Product Description -------- */
     const productDescription = (() => {
       const el = document.querySelector("#productDescription");
       if (!el) return "";
-      return cleanSpaces(el.innerText || el.textContent || "");
+      return (el.innerText || el.textContent || "").replace(/\s+/g, " ").trim();
     })();
 
-    // ========= IMAGES (YOUR EXACT BLOCK) + imageSourceCounts =========
+    /* -------- Rating & Review Count -------- */
+    const reviewCount = (() => {
+      const el = document.querySelector("#acrCustomerReviewText");
+      if (!el) return "";
+      const n = (el.innerText || el.textContent || "").replace(/[^\d]/g, "");
+      return n || "";
+    })();
+
+    const rating = (() => {
+      const el = document.querySelector("#acrPopover");
+      const titleAttr = el?.getAttribute("title") || "";
+      // e.g., "4.7 out of 5 stars" => "4.7"
+      const cleaned = titleAttr.replace(/out of 5 stars/i, "").replace(/\s+/g, " ").trim();
+      return cleaned || "";
+    })();
+
+    /* -------- Date First Available (detail bullets) -------- */
+    const dateFirstAvailable = (() => {
+      const container = document.querySelector("#detailBullets_feature_div");
+      if (!container) return "";
+      // Find the <li> where the bold span contains “Date First Available”
+      const li = Array.from(container.querySelectorAll("li")).find((node) => {
+        const label = (node.querySelector("span.a-text-bold")?.innerText || node.innerText || node.textContent || "");
+        return /date\s*first\s*available/i.test(label);
+      });
+      if (!li) return "";
+      // The next <span> (sibling) contains the date in many pages
+      const textSpans = Array.from(li.querySelectorAll("span")).map((s) => (s.innerText || s.textContent || "").trim()).filter(Boolean);
+      // Typically something like ["Date First Available : ", "September 7, 2017"]
+      const candidate = textSpans.find((s) => /\w+\s+\d{1,2},\s+\d{4}/.test(s));
+      if (candidate) return candidate;
+      // Fallback: clean the whole line and try to extract trailing date
+      const full = (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim();
+      const m = full.match(/date\s*first\s*available.*?(\b\w+\s+\d{1,2},\s+\d{4}\b)/i);
+      return (m && m[1]) || "";
+    })();
+
+    /* -------- Release date fallback (prodDetails table) -------- */
+    const releaseDate = (() => {
+      const root = document.querySelector("#prodDetails");
+      if (!root) return "";
+      const rows = Array.from(root.querySelectorAll("tr"));
+      for (const tr of rows) {
+        const th = tr.querySelector("th");
+        const td = tr.querySelector("td");
+        if (!th || !td) continue;
+        const label = (th.innerText || th.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+        if (/release\s*date|date\s*released|date\s*of\s*release/i.test(label)) {
+          const val = (td.innerText || td.textContent || "").replace(/\s+/g, " ").trim();
+          // Prefer a yyyy-style date shape if present
+          const m = val.match(/\b\w+\s+\d{1,2},\s+\d{4}\b/);
+          return (m && m[0]) || val;
+        }
+      }
+      return "";
+    })();
+
+    /* -------- Main Image (unchanged) -------- */
     const mainImageUrl = (() => {
       const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
       if (imgTag) return imgTag.getAttribute("src") || "";
@@ -493,238 +495,29 @@ async function scrapeProductData(page) {
     const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
-    // Source 1: visible thumbnails
-    let additionalImageUrls = Array.from(document.querySelectorAll("#altImages img, .imageThumb img"))
-      .map((img) => img.getAttribute("src") || "")
-      .map((src) => (src || "").trim())
-      .filter(Boolean);
-
-    // Source 2: landing image attributes
-    const landing = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
-    const fromLandingAttrs = [];
-    if (landing) {
-      const oldHires = landing.getAttribute("data-old-hires");
-      if (oldHires) fromLandingAttrs.push(oldHires);
-
-      const dyn = landing.getAttribute("data-a-dynamic-image");
-      if (dyn) {
-        try {
-          const clean = dyn.replace(/&quot;/g, '"');
-          const obj = JSON.parse(clean);
-          for (const k of Object.keys(obj || {})) fromLandingAttrs.push(k);
-        } catch {
-          try {
-            const clean2 = dyn
-              .replace(/&quot;/g, '"')
-              .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
-              .replace(/:\s*'([^']+?)'(\s*[},])/g, ':"$1"$2');
-            const obj2 = JSON.parse(clean2);
-            for (const k of Object.keys(obj2 || {})) fromLandingAttrs.push(k);
-          } catch {}
+    /* -------- Additional Images (ONLY from ImageBlockATF scripts, _AC_SL only) -------- */
+    const additionalImageUrls = (() => {
+      const AC_SL = /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi;
+      const scripts = Array.from(document.querySelectorAll("script"));
+      const urls = new Set();
+      for (const s of scripts) {
+        const txt = s.textContent || "";
+        // Only consider the ATF image block script
+        if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
+        // Pull only _AC_SL… hires URLs from this script’s text
+        const matches = txt.match(AC_SL) || [];
+        for (const m of matches) {
+          // strip query strings for stability
+          const clean = m.split("?")[0];
+          // avoid duplicating main image (normalized) if it happens to be AC_SL (usually it's SX/SY)
+          if (clean && clean !== normalizedMain) urls.add(clean);
         }
       }
-    }
-
-    // Source 3: global HTML sweep (hi-res _AC_SL)
-    const hiResMatches = Array.from(
-      document.documentElement.innerHTML.matchAll(
-        /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi
-      )
-    ).map((m) => m[0]);
-
-    // Track first source for counts BEFORE dedupe/filter (by raw URL)
-    const firstSourceByUrl = new Map();
-    const markIfFirst = (u, label) => {
-      if (!u) return;
-      const key = String(u);
-      if (!firstSourceByUrl.has(key)) firstSourceByUrl.set(key, label);
-    };
-    additionalImageUrls.forEach((u) => markIfFirst(u, "visibleThumbs"));
-    fromLandingAttrs.forEach((u) => markIfFirst(u, "landingAttrs"));
-    hiResMatches.forEach((u) => markIfFirst(u, "htmlSweep"));
-
-    // Merge (your original order: visible → landing → sweep) + dedupe
-    additionalImageUrls = [
-      ...additionalImageUrls,
-      ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
-      ...hiResMatches,
-    ];
-    additionalImageUrls = [...new Set(additionalImageUrls)];
-
-    // Remove junk thumbs/sprites/overlays
-    additionalImageUrls = additionalImageUrls.filter((src) => {
-      if (!src) return false;
-      const lower = src.toLowerCase();
-      return !(
-        lower.includes("sprite") ||
-        lower.includes("360_icon") ||
-        lower.includes("play-icon") ||
-        lower.includes("overlay") ||
-        lower.includes("fmjpg") ||
-        lower.includes("fmpng")
-      );
-    });
-
-    // Keep only _AC_SL{n}_.jpg and drop the main image (normalized to .jpg) if it matches
-    const AC_ANY = /\._AC_SL\d+_\.jpg(?:\?.*)?$/i;
-    additionalImageUrls = additionalImageUrls
-      .filter((url) => url && url !== normalizedMain)
-      .filter((url) => AC_ANY.test(url));
-
-    // Final de-dupe after filters
-    additionalImageUrls = [...new Set(additionalImageUrls)];
-
-    // imageSourceCounts: count by FIRST source for the final kept URLs
-    const imageSourceCounts = { visibleThumbs: 0, landingAttrs: 0, htmlSweep: 0 };
-    for (const u of additionalImageUrls) {
-      const label = firstSourceByUrl.get(u);
-      if (label === "visibleThumbs") imageSourceCounts.visibleThumbs++;
-      else if (label === "landingAttrs") imageSourceCounts.landingAttrs++;
-      else if (label === "htmlSweep") imageSourceCounts.htmlSweep++;
-    }
-    // ========= END IMAGES =========
-
-    // ========= Selected thumbnails with data-old-hires (only _AC_SL…) =========
-    const selectedOldHiresACSL = (() => {
-      // Find all <img data-old-hires> under #altImages whose closest selected ancestor
-      // (or itself) has a class token "selected" or "a-button-selected"
-      const imgs = Array.from(document.querySelectorAll('#altImages img[data-old-hires]'));
-      const keep = [];
-      for (const img of imgs) {
-        const url = (img.getAttribute('data-old-hires') || "").trim();
-        if (!url) continue;
-        // Climb ancestors to see if any have the 'selected' token
-        let node = img;
-        let isSelected = false;
-        while (node && node !== document.documentElement) {
-          if (node.classList && (node.classList.contains('selected') || node.classList.contains('a-button-selected'))) {
-            isSelected = true;
-            break;
-          }
-          node = node.parentElement;
-        }
-        if (!isSelected) continue;
-        if (!AC_ANY.test(url)) continue; // only _AC_SL… JPGs
-        keep.push(url.split('?')[0]); // normalize by dropping query
-      }
-      return [...new Set(keep)];
-    })();
-    // ========= END selectedOldHiresACSL =========
-
-    // -------- Reviews count --------
-    const reviewCount = (() => {
-      const el = document.querySelector("#acrCustomerReviewText");
-      if (!el) return "";
-      const raw = cleanText(el.innerText || el.textContent || "");
-      const digits = (raw.match(/\d/g) || []).join("");
-      return digits || "";
+      return Array.from(urls);
     })();
 
-    // -------- Rating (stars) --------
-    const rating = (() => {
-      const el = document.querySelector("#acrPopover");
-      const t = el?.getAttribute("title") || el?.getAttribute("aria-label") || "";
-      if (!t) return "";
-      return cleanSpaces(t.replace(/out of 5 stars/i, ""));
-    })();
-
-    // -------- Date First Available (with fallback to Release date) --------
-    const looksLikeDate = (s) =>
-      /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b\s+\d{1,2},\s*\d{4}/i.test(
-        s || ""
-      );
-    const stripLeadingLabel = (s) =>
-      cleanText((s || "").replace(/^date\s*first\s*available\s*[:\-–—]?\s*/i, ""));
-    const normLabel = (s) => cleanText(String(s || "").toLowerCase().replace(/[:\-–—]+/g, " "));
-    const dateFirstAvailable = (() => {
-      const nextSpanValue = (labelSpan) => {
-        if (!labelSpan) return "";
-        let sib = labelSpan.nextElementSibling;
-        while (sib) {
-          const txt = stripLeadingLabel(cleanText(sib.innerText || sib.textContent || ""));
-          if (txt) return txt;
-          sib = sib.nextElementSibling;
-        }
-        const parent = labelSpan.parentElement;
-        if (parent) {
-          const candidates = Array.from(parent.querySelectorAll("span"))
-            .filter((s) => !/a-text-bold/.test(s.className || ""));
-          for (const c of candidates) {
-            const val = stripLeadingLabel(cleanText(c.innerText || c.textContent || ""));
-            if (val) return val;
-          }
-        }
-        return "";
-      };
-
-      const container = document.querySelector("#detailBullets_feature_div");
-      if (container) {
-        const bolds = Array.from(container.querySelectorAll("span.a-text-bold"));
-        for (const b of bolds) {
-          const label = normLabel(b.innerText || b.textContent || "");
-          if (/^date\s*first\s*available\b/i.test(label)) {
-            const val = nextSpanValue(b);
-            if (val && looksLikeDate(val)) return val;
-          }
-        }
-        const li = Array.from(container.querySelectorAll("li")).find((el) =>
-          /date\s*first\s*available/i.test(el.innerText || el.textContent || "")
-        );
-        if (li) {
-          const spans = Array.from(li.querySelectorAll("span"));
-          for (const s of spans) {
-            const txt = stripLeadingLabel(cleanText(s.innerText || s.textContent || ""));
-            if (txt && looksLikeDate(txt)) return txt;
-          }
-          const raw = stripLeadingLabel(cleanText(li.innerText || li.textContent || ""));
-          if (looksLikeDate(raw)) return raw;
-        }
-      }
-
-      const detailsRoots = [
-        document.querySelector("#prodDetails"),
-        document.querySelector("#productDetails_detailBullets_sections1"),
-        document.querySelector("#productDetails_techSpec_section_1"),
-        document.querySelector("#productDetails_techSpec_section_2"),
-      ].filter(Boolean);
-
-      const isReleaseLabel = (txt) => {
-        const n = normLabel(txt);
-        return (
-          /\brelease\s*date\b/i.test(n) ||
-          /\breleased\s*date\b/i.test(n) ||
-          /\bdate\s*released\b/i.test(n) ||
-          /\bdate\s*of\s*release\b/i.test(n)
-        );
-      };
-      const isFirstAvailLabel = (txt) => /^date\s*first\s*available\b/i.test(normLabel(txt));
-
-      for (const root of detailsRoots) {
-        const rows = Array.from(root.querySelectorAll("tr"));
-        for (const tr of rows) {
-          const th = tr.querySelector("th");
-          const td = tr.querySelector("td");
-          if (!th || !td) continue;
-
-          const thText = cleanText(th.innerText || th.textContent || "");
-          const tdText = cleanText(td.innerText || td.textContent || "");
-          if (!tdText) continue;
-
-          if (isFirstAvailLabel(thText)) return tdText;
-          if (isReleaseLabel(thText)) return tdText; // fallback
-        }
-      }
-
-      const generic = Array.from(document.querySelectorAll("#prodDetails th, #prodDetails td, th, td, dt, dd"));
-      for (let i = 0; i < generic.length - 1; i++) {
-        const label = cleanText(generic[i].innerText || generic[i].textContent || "");
-        const value = cleanText(generic[i + 1].innerText || generic[i + 1].textContent || "");
-        if (!value) continue;
-        if (isFirstAvailLabel(label)) return stripLeadingLabel(value);
-        if (looksLikeDate(value) && /available|release/i.test(label)) return stripLeadingLabel(value);
-      }
-      return "";
-    })();
+    // Final date: prefer Date First Available, else Release date
+    const finalDateFirstAvailable = dateFirstAvailable || releaseDate || "";
 
     return {
       title: (title || "").trim(),
@@ -734,11 +527,9 @@ async function scrapeProductData(page) {
       productDescription: (productDescription || "").trim(),
       mainImageUrl: normalizedMain || "",
       additionalImageUrls,
-      imageSourceCounts,              // counts per source for final kept images
-      selectedOldHiresACSL,          // NEW: _AC_SL URLs from data-old-hires on selected thumbs
       reviewCount,
       rating,
-      dateFirstAvailable,
+      dateFirstAvailable: finalDateFirstAvailable,
     };
   }, title);
 }
@@ -815,33 +606,19 @@ app.get("/", (req, res) => {
   res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
 });
 
-/**
- * Detour recognizer: pages that are NOT products
- */
-function isDetourUrl(u = "") {
-  if (!u) return false;
-  if (isDpUrl(u)) return false; // /dp/... or /gp/product/... are NOT detours
-  return (
-    /\/hz\/mobile/i.test(u) ||
-    /\/ap\/signin/i.test(u) ||
-    /\/gp\/help/i.test(u) ||
-    /\/gp\/navigation/i.test(u) ||
-    /\/customer-preferences/i.test(u) ||
-    /\/gp\/yourstore/i.test(u) ||
-    /\/gp\/history/i.test(u)
-  );
-}
-
 app.get("/scrape", async (req, res) => {
-  const targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).json({ ok: false, error: "Missing url param" });
+  const inputUrl = req.query.url;
+  if (!inputUrl) return res.status(400).json({ ok: false, error: "Missing url param" });
 
   const width = 1280, height = 800;
-  let browser, context, page;
+  const asin = extractASINFromUrl(inputUrl);
+  const intendedDpUrl = buildDpUrl(asin);
+  const returnUrl = intendedDpUrl || inputUrl;
 
-  // Counters/metrics
+  let browser, context, page;
+  // detour bounce tracking
   let detourBounceAttempts = 0;
-  let continueShoppingDismissals = 0;
+  const MAX_DETOUR_BOUNCES = 3;
 
   try {
     const ctx = await minimalContext(width, height);
@@ -849,46 +626,48 @@ app.get("/scrape", async (req, res) => {
     context = ctx.context;
     page = ctx.page;
 
-    // 1) First navigation
-    await safeGoto(page, targetUrl, { retries: 2, timeout: 60000 });
+    // First nav
+    await safeGoto(page, inputUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // 2) Detour-bounce loop (max 3). Small delay before checking, to allow redirects to settle.
-    for (let i = 0; i < 3; i++) {
-      await sleep(jitter(250, 350));
-      const cur = page.url();
-      if (!isDetourUrl(cur)) break;
+    // If detoured, bounce back to intended /dp/ASIN up to 3 times with a short settle delay
+    const bounceBackToDp = async () => {
+      if (!intendedDpUrl) return;
+      for (let i = 0; i < MAX_DETOUR_BOUNCES; i++) {
+        await sleep(300); // let URL stabilize (avoids counting transient navs)
+        const curUrl = page.url();
+        if (isDpUrl(curUrl)) break; // already on dp
+        if (isLikelyDetourUrl(curUrl) || !isDpUrl(curUrl)) {
+          detourBounceAttempts++;
+          await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
+          // handle continue shopping after bounce
+          page = await handleContinueShopping(page, context, intendedDpUrl, null);
+          if (await hasProductTitle(page)) break;
+        } else {
+          break;
+        }
+      }
+    };
+    await bounceBackToDp();
 
-      detourBounceAttempts++;
-      await safeGoto(page, targetUrl, { retries: 1, timeout: 60000 });
-      await sleep(jitter(250, 350));
+    // If we are on /dp/ but no title yet, simple fallback click
+    if (isDpUrl(page.url()) && !(await hasProductTitle(page))) {
+      await trySimpleContinueShoppingFallback(page, 3, null);
     }
 
-    // 3) Continue-shopping handling up to 3 dismissals until product looks ready
-    for (let i = 0; i < 3; i++) {
-      const { page: p2, dismissed } = await handleContinueShopping(page, context, targetUrl);
-      page = p2;
-      if (dismissed) continueShoppingDismissals++;
-      const ready = await isProductPage(page);
-      if (ready) break;
-      await sleep(jitter(200, 300));
-    }
-
-    // 4) Product vs non-product final check
-    let productLike;
-    try {
-      productLike = await isProductPage(page);
-    } catch (e) {
-      if (isClosedErr(e)) {
-        page = await adoptActivePageOrThrow(page, context);
-        await sleep(200);
+    // Final product check; if not product after bounces, return nonProduct JSON
+    let productLike = await isProductPage(page);
+    if (!productLike) {
+      // One last try: if we know intended dp, attempt a final bounce
+      if (intendedDpUrl && detourBounceAttempts < MAX_DETOUR_BOUNCES) {
+        detourBounceAttempts++;
+        await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
+        page = await handleContinueShopping(page, context, intendedDpUrl, null);
         productLike = await isProductPage(page);
-      } else {
-        throw e;
       }
     }
 
-    // 4a) NON-PRODUCT → return minimal info + screenshot + metrics
+    // If still non-product, return nonProduct JSON quickly
     if (!productLike) {
       let bufNP;
       try {
@@ -902,31 +681,33 @@ app.get("/scrape", async (req, res) => {
         }
       }
       const base64NP = bufNP.toString("base64");
-      const meta = {
-        currentUrl: page.url(),
-        title: (await page.title().catch(() => "")) || "",
-      };
-      const { links, buttons, counts } = await extractLinksAndButtons(page).catch(() => ({
-        links: [],
-        buttons: [],
-        counts: { links: 0, buttons: 0 },
-      }));
       return res.json({
         ok: true,
-        url: meta.currentUrl,
+        url: page.url() || returnUrl,
         pageType: "nonProduct",
-        detourBounceAttempts,              // debugging
-        continueShoppingDismissals,        // number of times we clicked/dismissed
+        detourBounceAttempts,
         screenshot: base64NP,
-        meta,
-        links,
-        buttons,
-        counts,
       });
     }
 
-    // 5) PRODUCT PAGE: scrape DOM, take screenshot, OCR
-    await sleep(jitter(300, 400)); // stabilize
+    // From here we are on product-like; deal with any inline/overlay “continue shopping” loops
+    for (let i = 0; i < 3; i++) {
+      const before = page.url();
+      const handled = await clickContinueShoppingIfPresent(page);
+      if (!handled) break;
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: "commit", timeout: 8000 }).catch(() => null),
+        page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => null),
+      ]);
+      const after = page.url();
+      if (await hasProductTitle(page)) break;
+      if (after === before) await sleep(350);
+    }
+
+    // Small pause to stabilize above-the-fold
+    await sleep(jitter(300, 400));
+
+    // Scrape DOM
     let scraped;
     try {
       scraped = await scrapeProductData(page);
@@ -941,6 +722,7 @@ app.get("/scrape", async (req, res) => {
     }
 
     ensureAlive(page, "Page closed before screenshot");
+    // Screenshot for OCR
     let buf;
     try {
       buf = await safeScreenshot(page, { type: "png" }, 1);
@@ -954,22 +736,22 @@ app.get("/scrape", async (req, res) => {
     }
     const base64 = buf.toString("base64");
 
-    const gemini = await geminiExtract(base64);
-    const priceGemini = normalizeGeminiPrice(gemini.price, scraped.price);
+    // OCR brand + price
+    const gem = await geminiExtract(base64);
+    const priceGemini = normalizeGeminiPrice(gem.price, scraped.price);
 
-    const resolvedUrl = page.url() || targetUrl;
-    const asinResolved = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(targetUrl);
+    // ASIN from final URL (or input as fallback)
+    const resolvedUrl = page.url() || returnUrl;
+    const finalAsin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(inputUrl);
 
-    // FINAL JSON (imageSourceCounts + selectedOldHiresACSL included)
+    // Final JSON (structure unchanged except new fields already introduced earlier)
     res.json({
       ok: true,
       url: resolvedUrl,
       pageType: "product",
-      detourBounceAttempts,
-      continueShoppingDismissals,
-      ASIN: asinResolved || "Unspecified",
+      ASIN: finalAsin || "Unspecified",
       title: scraped.title || "Unspecified",
-      brand: gemini.brand || "Unspecified",
+      brand: gem.brand || "Unspecified",
       itemForm: scraped.itemForm || "Unspecified",
       price: scraped.price || "Unspecified",
       priceGemini: priceGemini || "Unspecified",
@@ -977,12 +759,11 @@ app.get("/scrape", async (req, res) => {
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
-      imageSourceCounts: scraped.imageSourceCounts || { visibleThumbs: 0, landingAttrs: 0, htmlSweep: 0 },
-      selectedOldHiresACSL: scraped.selectedOldHiresACSL || [],
       reviewCount: scraped.reviewCount || "Unspecified",
       rating: scraped.rating || "Unspecified",
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
       screenshot: base64,
+      detourBounceAttempts,
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err?.message || String(err) });
