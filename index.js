@@ -401,7 +401,7 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
 
 /* ------------------------------- DOM scraping ------------------------------ */
 /**
- * Scrape product data (DOM-only fields) + imageSourceCounts
+ * Scrape product data (DOM-only fields) + imageSourceCounts + selectedOldHiresACSL
  */
 async function scrapeProductData(page) {
   const title =
@@ -549,7 +549,6 @@ async function scrapeProductData(page) {
       ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
       ...hiResMatches,
     ];
-
     additionalImageUrls = [...new Set(additionalImageUrls)];
 
     // Remove junk thumbs/sprites/overlays
@@ -584,6 +583,33 @@ async function scrapeProductData(page) {
       else if (label === "htmlSweep") imageSourceCounts.htmlSweep++;
     }
     // ========= END IMAGES =========
+
+    // ========= Selected thumbnails with data-old-hires (only _AC_SL…) =========
+    const selectedOldHiresACSL = (() => {
+      // Find all <img data-old-hires> under #altImages whose closest selected ancestor
+      // (or itself) has a class token "selected" or "a-button-selected"
+      const imgs = Array.from(document.querySelectorAll('#altImages img[data-old-hires]'));
+      const keep = [];
+      for (const img of imgs) {
+        const url = (img.getAttribute('data-old-hires') || "").trim();
+        if (!url) continue;
+        // Climb ancestors to see if any have the 'selected' token
+        let node = img;
+        let isSelected = false;
+        while (node && node !== document.documentElement) {
+          if (node.classList && (node.classList.contains('selected') || node.classList.contains('a-button-selected'))) {
+            isSelected = true;
+            break;
+          }
+          node = node.parentElement;
+        }
+        if (!isSelected) continue;
+        if (!AC_ANY.test(url)) continue; // only _AC_SL… JPGs
+        keep.push(url.split('?')[0]); // normalize by dropping query
+      }
+      return [...new Set(keep)];
+    })();
+    // ========= END selectedOldHiresACSL =========
 
     // -------- Reviews count --------
     const reviewCount = (() => {
@@ -708,7 +734,8 @@ async function scrapeProductData(page) {
       productDescription: (productDescription || "").trim(),
       mainImageUrl: normalizedMain || "",
       additionalImageUrls,
-      imageSourceCounts, // counts per source for the final kept images
+      imageSourceCounts,              // counts per source for final kept images
+      selectedOldHiresACSL,          // NEW: _AC_SL URLs from data-old-hires on selected thumbs
       reviewCount,
       rating,
       dateFirstAvailable,
@@ -933,7 +960,7 @@ app.get("/scrape", async (req, res) => {
     const resolvedUrl = page.url() || targetUrl;
     const asinResolved = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(targetUrl);
 
-    // FINAL JSON (imageSourceCounts included)
+    // FINAL JSON (imageSourceCounts + selectedOldHiresACSL included)
     res.json({
       ok: true,
       url: resolvedUrl,
@@ -951,6 +978,7 @@ app.get("/scrape", async (req, res) => {
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
       imageSourceCounts: scraped.imageSourceCounts || { visibleThumbs: 0, landingAttrs: 0, htmlSweep: 0 },
+      selectedOldHiresACSL: scraped.selectedOldHiresACSL || [],
       reviewCount: scraped.reviewCount || "Unspecified",
       rating: scraped.rating || "Unspecified",
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
