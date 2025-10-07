@@ -402,6 +402,7 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
 /* ------------------------------- DOM scraping ------------------------------ */
 /**
  * Scrape product data (DOM-only fields) + EXPERIMENT: imageSourceCounts
+ * IMPORTANT: additionalImageUrls now ONLY keep URLs that end with ._AC_SL{n}_.jpg
  */
 async function scrapeProductData(page) {
   const title =
@@ -534,12 +535,13 @@ async function scrapeProductData(page) {
       return out.map((u) => (u || "").trim()).filter(Boolean);
     })();
 
-    // Source C: global HTML sweep (hi-res URLs)
+    // Source C: global HTML sweep (hi-res URLs, already AC_SL)
     const srcHtmlSweepRaw = Array.from(
       document.documentElement.innerHTML.matchAll(/https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi)
     ).map((m) => (m[0] || "").trim());
 
-    // Filter/normalize the three sources the same way
+    // Filter/normalize and keep ONLY _AC_SL{n}_ images
+    const AC_SL_ONLY = /\._AC_SL\d+_\.jpg$/i;
     const isJunk = (src) => {
       const lower = (src || "").toLowerCase();
       return (
@@ -553,14 +555,14 @@ async function scrapeProductData(page) {
         lower.includes("fmpng")
       );
     };
-    const normFilter = (arr) =>
+    const normFilterSL = (arr) =>
       arr
         .map((u) => normalizeImageUrl(u))
-        .filter((u) => /\.jpg$/i.test(u) && !isJunk(u));
+        .filter((u) => AC_SL_ONLY.test(u) && !isJunk(u));
 
-    const srcVisibleThumbs = normFilter(srcVisibleThumbsRaw);
-    const srcLandingAttrs = normFilter(srcLandingAttrsRaw);
-    const srcHtmlSweep   = normFilter(srcHtmlSweepRaw);
+    const srcVisibleThumbs = normFilterSL(srcVisibleThumbsRaw);
+    const srcLandingAttrs  = normFilterSL(srcLandingAttrsRaw);
+    const srcHtmlSweep     = normFilterSL(srcHtmlSweepRaw);
 
     // Merge with de-dupe while tracking first contributing source for counts
     const merged = [];
@@ -711,8 +713,8 @@ async function scrapeProductData(page) {
       featuredBullets: (featuredBullets || "").trim(),
       productDescription: (productDescription || "").trim(),
       mainImageUrl: normalizedMain || "",
-      additionalImageUrls: merged,
-      imageSourceCounts, // <<<<<< EXPERIMENT: counts by source
+      additionalImageUrls: merged,            // ONLY _AC_SL{n}_ URLs now
+      imageSourceCounts,                      // EXPERIMENTAL
       reviewCount,
       rating,
       dateFirstAvailable,
@@ -953,11 +955,11 @@ app.get("/scrape", async (req, res) => {
       featuredBullets: scraped.featuredBullets || "Unspecified",
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
-      additionalImageUrls: scraped.additionalImageUrls || [],
+      additionalImageUrls: scraped.additionalImageUrls || [], // ONLY _AC_SL{n}_ URLs
       reviewCount: scraped.reviewCount || "Unspecified",
       rating: scraped.rating || "Unspecified",
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
-      imageSourceCounts: scraped.imageSourceCounts || { visibleThumbs: 0, landingAttrs: 0, htmlSweep: 0 }, // << EXPERIMENT
+      imageSourceCounts: scraped.imageSourceCounts || { visibleThumbs: 0, landingAttrs: 0, htmlSweep: 0 }, // EXPERIMENT
       screenshot: base64,
     });
   } catch (err) {
