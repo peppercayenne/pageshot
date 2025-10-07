@@ -401,8 +401,7 @@ async function extractLinksAndButtons(page, limits = { maxLinks: 300, maxButtons
 
 /* ------------------------------- DOM scraping ------------------------------ */
 /**
- * Scrape product data (DOM-only fields) + EXPERIMENT: imageSourceCounts
- * IMPORTANT: additionalImageUrls now ONLY keep URLs that end with ._AC_SL{n}_.jpg
+ * Scrape product data (DOM-only fields) + imageSourceCounts
  */
 async function scrapeProductData(page) {
   const title =
@@ -485,68 +484,79 @@ async function scrapeProductData(page) {
       return cleanSpaces(el.innerText || el.textContent || "");
     })();
 
-    // -------- Images + EXPERIMENTAL counts by source --------
-    // Preserve Amazon size tokens; only strip query strings
-    const normalizeImageUrl = (url) => {
-      if (!url) return "";
-      const noQuery = url.split("?")[0];
-      return noQuery.trim();
-    };
-
+    // ========= IMAGES (YOUR EXACT BLOCK) + imageSourceCounts =========
     const mainImageUrl = (() => {
       const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
       if (imgTag) return imgTag.getAttribute("src") || "";
       return "";
     })();
+    const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
-    // Source A: visible thumbs
-    const srcVisibleThumbsRaw = Array.from(document.querySelectorAll("#altImages img, .imageThumb img"))
-      .map((img) => img.getAttribute("data-old-hires") || img.getAttribute("data-a-hires") || img.getAttribute("src") || "")
-      .map((u) => (u || "").trim())
+    // Source 1: visible thumbnails
+    let additionalImageUrls = Array.from(document.querySelectorAll("#altImages img, .imageThumb img"))
+      .map((img) => img.getAttribute("src") || "")
+      .map((src) => (src || "").trim())
       .filter(Boolean);
 
-    // Source B: landing image attributes (data-old-hires + data-a-dynamic-image keys)
-    const srcLandingAttrsRaw = (() => {
-      const out = [];
-      const landing = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
-      if (landing) {
-        const oldHires = landing.getAttribute("data-old-hires");
-        if (oldHires) out.push(oldHires);
-        const dyn = landing.getAttribute("data-a-dynamic-image");
-        if (dyn) {
-          const pushKeys = (obj) => { for (const k of Object.keys(obj || {})) if (k) out.push(k); };
+    // Source 2: landing image attributes
+    const landing = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
+    const fromLandingAttrs = [];
+    if (landing) {
+      const oldHires = landing.getAttribute("data-old-hires");
+      if (oldHires) fromLandingAttrs.push(oldHires);
+
+      const dyn = landing.getAttribute("data-a-dynamic-image");
+      if (dyn) {
+        try {
+          const clean = dyn.replace(/&quot;/g, '"');
+          const obj = JSON.parse(clean);
+          for (const k of Object.keys(obj || {})) fromLandingAttrs.push(k);
+        } catch {
           try {
-            const clean = dyn.replace(/&quot;/g, '"');
-            const obj = JSON.parse(clean);
-            pushKeys(obj);
-          } catch {
-            try {
-              const clean2 = dyn
-                .replace(/&quot;/g, '"')
-                .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
-                .replace(/:\s*'([^']+?)'(\s*[},])/g, ':"$1"$2');
-              const obj2 = JSON.parse(clean2);
-              pushKeys(obj2);
-            } catch {}
-          }
+            const clean2 = dyn
+              .replace(/&quot;/g, '"')
+              .replace(/([{,]\s*)'([^']+?)'\s*:/g, '$1"$2":')
+              .replace(/:\s*'([^']+?)'(\s*[},])/g, ':"$1"$2');
+            const obj2 = JSON.parse(clean2);
+            for (const k of Object.keys(obj2 || {})) fromLandingAttrs.push(k);
+          } catch {}
         }
       }
-      return out.map((u) => (u || "").trim()).filter(Boolean);
-    })();
+    }
 
-    // Source C: global HTML sweep (hi-res URLs, already AC_SL)
-    const srcHtmlSweepRaw = Array.from(
-      document.documentElement.innerHTML.matchAll(/https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi)
-    ).map((m) => (m[0] || "").trim());
+    // Source 3: global HTML sweep (hi-res _AC_SL)
+    const hiResMatches = Array.from(
+      document.documentElement.innerHTML.matchAll(
+        /https:\/\/[^"\s]+?\._AC_SL\d+_\.jpg(?:\?[^"\s]*)?/gi
+      )
+    ).map((m) => m[0]);
 
-    // Filter/normalize and keep ONLY _AC_SL{n}_ images
-    const AC_SL_ONLY = /\._AC_SL\d+_\.jpg$/i;
-    const isJunk = (src) => {
-      const lower = (src || "").toLowerCase();
-      return (
-        !src ||
-        src === normalizedMain ||
+    // Track first source for counts BEFORE dedupe/filter (by raw URL)
+    const firstSourceByUrl = new Map();
+    const markIfFirst = (u, label) => {
+      if (!u) return;
+      const key = String(u);
+      if (!firstSourceByUrl.has(key)) firstSourceByUrl.set(key, label);
+    };
+    additionalImageUrls.forEach((u) => markIfFirst(u, "visibleThumbs"));
+    fromLandingAttrs.forEach((u) => markIfFirst(u, "landingAttrs"));
+    hiResMatches.forEach((u) => markIfFirst(u, "htmlSweep"));
+
+    // Merge (your original order: visible → landing → sweep) + dedupe
+    additionalImageUrls = [
+      ...additionalImageUrls,
+      ...fromLandingAttrs.map((u) => (u || "").trim()).filter(Boolean),
+      ...hiResMatches,
+    ];
+
+    additionalImageUrls = [...new Set(additionalImageUrls)];
+
+    // Remove junk thumbs/sprites/overlays
+    additionalImageUrls = additionalImageUrls.filter((src) => {
+      if (!src) return false;
+      const lower = src.toLowerCase();
+      return !(
         lower.includes("sprite") ||
         lower.includes("360_icon") ||
         lower.includes("play-icon") ||
@@ -554,42 +564,26 @@ async function scrapeProductData(page) {
         lower.includes("fmjpg") ||
         lower.includes("fmpng")
       );
-    };
-    const normFilterSL = (arr) =>
-      arr
-        .map((u) => normalizeImageUrl(u))
-        .filter((u) => AC_SL_ONLY.test(u) && !isJunk(u));
+    });
 
-    const srcVisibleThumbs = normFilterSL(srcVisibleThumbsRaw);
-    const srcLandingAttrs  = normFilterSL(srcLandingAttrsRaw);
-    const srcHtmlSweep     = normFilterSL(srcHtmlSweepRaw);
+    // Keep only _AC_SL{n}_.jpg and drop the main image (normalized to .jpg) if it matches
+    const AC_ANY = /\._AC_SL\d+_\.jpg(?:\?.*)?$/i;
+    additionalImageUrls = additionalImageUrls
+      .filter((url) => url && url !== normalizedMain)
+      .filter((url) => AC_ANY.test(url));
 
-    // Merge with de-dupe while tracking first contributing source for counts
-    const merged = [];
-    const seen = new Set();
-    const firstSourceByUrl = new Map();
-    const take = (arr, label) => {
-      for (const u of arr) {
-        const key = u.toLowerCase();
-        if (seen.has(key)) continue;
-        seen.add(key);
-        firstSourceByUrl.set(key, label);
-        merged.push(u);
-      }
-    };
-    // Prefer landing first, then visible thumbs, then global sweep
-    take(srcLandingAttrs, "landingAttrs");
-    take(srcVisibleThumbs, "visibleThumbs");
-    take(srcHtmlSweep, "htmlSweep");
+    // Final de-dupe after filters
+    additionalImageUrls = [...new Set(additionalImageUrls)];
 
-    // EXPERIMENT: tally counts by FIRST source
+    // imageSourceCounts: count by FIRST source for the final kept URLs
     const imageSourceCounts = { visibleThumbs: 0, landingAttrs: 0, htmlSweep: 0 };
-    for (const [, label] of firstSourceByUrl) {
+    for (const u of additionalImageUrls) {
+      const label = firstSourceByUrl.get(u);
       if (label === "visibleThumbs") imageSourceCounts.visibleThumbs++;
       else if (label === "landingAttrs") imageSourceCounts.landingAttrs++;
       else if (label === "htmlSweep") imageSourceCounts.htmlSweep++;
     }
-    // ----- end EXPERIMENT -----
+    // ========= END IMAGES =========
 
     // -------- Reviews count --------
     const reviewCount = (() => {
@@ -713,8 +707,8 @@ async function scrapeProductData(page) {
       featuredBullets: (featuredBullets || "").trim(),
       productDescription: (productDescription || "").trim(),
       mainImageUrl: normalizedMain || "",
-      additionalImageUrls: merged,            // ONLY _AC_SL{n}_ URLs now
-      imageSourceCounts,                      // EXPERIMENTAL
+      additionalImageUrls,
+      imageSourceCounts, // counts per source for the final kept images
       reviewCount,
       rating,
       dateFirstAvailable,
@@ -939,7 +933,7 @@ app.get("/scrape", async (req, res) => {
     const resolvedUrl = page.url() || targetUrl;
     const asinResolved = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(targetUrl);
 
-    // FINAL JSON (includes EXPERIMENTAL imageSourceCounts)
+    // FINAL JSON (imageSourceCounts included)
     res.json({
       ok: true,
       url: resolvedUrl,
@@ -955,11 +949,11 @@ app.get("/scrape", async (req, res) => {
       featuredBullets: scraped.featuredBullets || "Unspecified",
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
-      additionalImageUrls: scraped.additionalImageUrls || [], // ONLY _AC_SL{n}_ URLs
+      additionalImageUrls: scraped.additionalImageUrls || [],
+      imageSourceCounts: scraped.imageSourceCounts || { visibleThumbs: 0, landingAttrs: 0, htmlSweep: 0 },
       reviewCount: scraped.reviewCount || "Unspecified",
       rating: scraped.rating || "Unspecified",
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
-      imageSourceCounts: scraped.imageSourceCounts || { visibleThumbs: 0, landingAttrs: 0, htmlSweep: 0 }, // EXPERIMENT
       screenshot: base64,
     });
   } catch (err) {
