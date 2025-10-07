@@ -190,17 +190,12 @@ async function closeAttachSideSheetIfVisible(page) {
 }
 
 async function clickContinueShoppingIfPresent(page) {
-  // 1) Try popover/side-sheet first (fast path)
   if (await closeAttachSideSheetIfVisible(page)) return true;
 
-  // 2) Known IDs/classes/attrs from overlays and inline layouts
   const KNOWN_SELECTORS = [
-    /* HUC / overlay */
     '#hlb-continue-shopping-announce',
     'a#hlb-continue-shopping-announce',
     '#attach-close_sideSheet-link',
-
-    /* Inline/cart/confirmation variants */
     '#continue-shopping',
     'button#continue-shopping',
     'a#continue-shopping',
@@ -208,8 +203,6 @@ async function clickContinueShoppingIfPresent(page) {
     'a#sc-continue-shopping-link',
     'a[href*="continueShopping"]',
     'button[name*="continueShopping"]',
-
-    /* Generic text matches via Playwright’s :has-text (visible-only) */
     'a:has-text("Continue shopping")',
     'button:has-text("Continue shopping")',
     'a:has-text("Keep shopping")',
@@ -226,7 +219,6 @@ async function clickContinueShoppingIfPresent(page) {
     } catch {}
   }
 
-  // 3) DOM-wide fallback: scan common clickables with visibility guard
   try {
     const clicked = await page.evaluate(() => {
       const _isNodeVisible = (el) => {
@@ -499,6 +491,12 @@ async function scrapeProductData(page) {
     const stripPunct = (s) => (s || "").replace(/[:\-–—]+/g, " ");
     const cleanText = (s) => cleanSpaces(stripMarks(s));
     const normLabel = (s) => cleanSpaces(stripPunct(stripMarks((s || "").toLowerCase())));
+    const looksLikeDate = (s) =>
+      /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b\s+\d{1,2},\s*\d{4}/i.test(
+        s || ""
+      );
+    const stripLeadingLabel = (s) =>
+      cleanText((s || "").replace(/^date\s*first\s*available\s*[:\-–—]?\s*/i, ""));
 
     // -------- Item Form --------
     const itemForm = (() => {
@@ -667,55 +665,59 @@ async function scrapeProductData(page) {
 
     // -------- Date First Available + fallback to Release date --------
     const dateFirstAvailable = (() => {
-      // 1) Preferred: #detailBullets_feature_div → bold label span → next *visible* sibling span text
-      const container = document.querySelector("#detailBullets_feature_div");
-      const getNextSpanValue = (labelSpan) => {
+      // Helper: pick the next non-bold span's text from a bold label span
+      const nextSpanValue = (labelSpan) => {
         if (!labelSpan) return "";
-        // Try the immediate next sibling spans within the same list item/container
+        // Immediate following siblings
         let sib = labelSpan.nextElementSibling;
         while (sib) {
           const txt = cleanText(sib.innerText || sib.textContent || "");
-          if (txt) return txt;
+          if (txt) return stripLeadingLabel(txt);
           sib = sib.nextElementSibling;
         }
-        // Fallback: any non-bold span in the same parent (common structure: two spans)
+        // Otherwise, search for a non-bold span in the same parent
         const parent = labelSpan.parentElement;
         if (parent) {
-          const nonBold = Array.from(parent.querySelectorAll("span:not(.a-text-bold)"))
-            .map((s) => cleanText(s.innerText || s.textContent || ""))
-            .find((s) => !!s);
-          if (nonBold) return nonBold;
+          const candidates = Array.from(parent.querySelectorAll("span"))
+            .filter((s) => !/a-text-bold/.test(s.className || ""));
+          for (const c of candidates) {
+            const val = cleanText(c.innerText || c.textContent || "");
+            if (val) return stripLeadingLabel(val);
+          }
         }
         return "";
       };
 
+      // 1) Preferred: #detailBullets_feature_div
+      const container = document.querySelector("#detailBullets_feature_div");
       if (container) {
-        // Scan all bold spans under the bullets container
-        const bolds = Array.from(container.querySelectorAll("span.a-text-bold, span"))
-          .filter((s) => /a-text-bold/.test(s.className || "") || /:/.test(s.textContent || ""));
+        // Try strict bold-span pattern
+        const bolds = Array.from(container.querySelectorAll("span.a-text-bold"));
         for (const b of bolds) {
           const label = normLabel(b.innerText || b.textContent || "");
-          // normalize e.g. "date first available :"
           if (/^date\s*first\s*available\b/i.test(label)) {
-            const val = getNextSpanValue(b);
-            if (val) return val;
+            const val = nextSpanValue(b);
+            if (val && looksLikeDate(val)) return val;
           }
         }
-        // As a secondary attempt, parse whole li text lines
-        const item = Array.from(container.querySelectorAll("li")).find((li) =>
-          /date\s*first\s*available/i.test(li.innerText || li.textContent || "")
+        // If still not found, inspect each <li> and pick the date-looking piece after the label
+        const li = Array.from(container.querySelectorAll("li")).find((el) =>
+          /date\s*first\s*available/i.test(el.innerText || el.textContent || "")
         );
-        if (item) {
-          const raw = cleanText(item.innerText || item.textContent || "");
-          const m = raw.match(/date\s*first\s*available\s*[:\-]?\s*(.+)$/i);
-          if (m && m[1]) {
-            const candidate = cleanText(m[1]);
-            if (candidate) return candidate;
+        if (li) {
+          // Prefer the first non-bold span with a date-looking value
+          const spans = Array.from(li.querySelectorAll("span"));
+          for (const s of spans) {
+            const txt = stripLeadingLabel(cleanText(s.innerText || s.textContent || ""));
+            if (txt && looksLikeDate(txt)) return txt;
           }
+          // Last resort: strip label from the whole li text
+          const raw = stripLeadingLabel(cleanText(li.innerText || li.textContent || ""));
+          if (looksLikeDate(raw)) return raw;
         }
       }
 
-      // 2) Fallback: classic product details tables (including #prodDetails)
+      // 2) Fallback: details tables (including #prodDetails)
       const detailsRoots = [
         document.querySelector("#prodDetails"),
         document.querySelector("#productDetails_detailBullets_sections1"),
@@ -725,7 +727,6 @@ async function scrapeProductData(page) {
 
       const isReleaseLabel = (txt) => {
         const n = normLabel(txt);
-        // match "release date", "released date", "date of release", "date released", etc.
         return (
           /\brelease\s*date\b/i.test(n) ||
           /\breleased\s*date\b/i.test(n) ||
@@ -733,7 +734,6 @@ async function scrapeProductData(page) {
           /\bdate\s*of\s*release\b/i.test(n)
         );
       };
-
       const isFirstAvailLabel = (txt) => /^date\s*first\s*available\b/i.test(normLabel(txt));
 
       for (const root of detailsRoots) {
@@ -747,23 +747,21 @@ async function scrapeProductData(page) {
           const tdText = cleanText(td.innerText || td.textContent || "");
           if (!tdText) continue;
 
-          // Prefer exact "Date First Available" if present in tables
           if (isFirstAvailLabel(thText)) return tdText;
-
-          // Otherwise accept Release date variants as fallback
-          if (isReleaseLabel(thText)) return tdText;
+          if (isReleaseLabel(thText)) return tdText; // fallback
         }
       }
 
-      // 3) Last-chance: scan any definition lists or spans for release/date labels
-      const genericRows = Array.from(
+      // 3) Very last-chance: generic scan for label → value pairs
+      const generic = Array.from(
         document.querySelectorAll("#prodDetails th, #prodDetails td, th, td, dt, dd")
       );
-      for (let i = 0; i < genericRows.length - 1; i++) {
-        const label = cleanText(genericRows[i].innerText || genericRows[i].textContent || "");
-        const value = cleanText(genericRows[i + 1].innerText || genericRows[i + 1].textContent || "");
+      for (let i = 0; i < generic.length - 1; i++) {
+        const label = cleanText(generic[i].innerText || generic[i].textContent || "");
+        const value = cleanText(generic[i + 1].innerText || generic[i + 1].textContent || "");
         if (!value) continue;
-        if (isFirstAvailLabel(label) || isReleaseLabel(label)) return value;
+        if (isFirstAvailLabel(label)) return stripLeadingLabel(value);
+        if (looksLikeDate(value) && /available|release/i.test(label)) return stripLeadingLabel(value);
       }
 
       return "";
@@ -777,7 +775,6 @@ async function scrapeProductData(page) {
       productDescription: (productDescription || "").trim(),
       mainImageUrl: normalizedMain || "",
       additionalImageUrls,
-      // New fields:
       reviewCount,
       rating,
       dateFirstAvailable,
@@ -908,21 +905,17 @@ app.get("/scrape", async (req, res) => {
     context = ctx.context;
     page = ctx.page;
 
-    // First nav
     await safeGoto(page, originalUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Early overlay cleanup
     page = await handleContinueShopping(page, context, targetUrl);
     ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
 
-    // Bounce logic with settle detection (MAX_BOUNCES = 3)
     const MAX_BOUNCES = 3;
     const { page: pageAfterBounce, attempts: detourBounceAttempts, currentUrl } =
       await detectAndBounceIfDetour(page, context, targetUrl, { maxBounces: MAX_BOUNCES, settleMs: 3500 });
     page = pageAfterBounce;
 
-    // If still on detour, return nonProduct JSON
     if (!isProductUrl(currentUrl) || isLikelyDetourUrl(currentUrl)) {
       let bufNP;
       try {
@@ -962,10 +955,8 @@ app.get("/scrape", async (req, res) => {
       });
     }
 
-    // Ensure product is "ready"
     await ensureProductReady(page, context, targetUrl, { maxRounds: 3, settleMs: 1200 });
 
-    // Confirm product-like DOM
     let productLike;
     try {
       productLike = await isProductPage(page);
@@ -1018,7 +1009,6 @@ app.get("/scrape", async (req, res) => {
       });
     }
 
-    // Stabilize and scrape
     await sleep(jitter(300, 400));
 
     let scraped;
@@ -1058,7 +1048,7 @@ app.get("/scrape", async (req, res) => {
       ok: true,
       url: resolvedUrl,
       pageType: "product",
-      detourBounceAttempts, // report attempts even on success
+      detourBounceAttempts,
       ASIN: asinResolved || "Unspecified",
       title: scraped.title || "Unspecified",
       brand: gemini.brand || "Unspecified",
