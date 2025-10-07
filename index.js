@@ -496,7 +496,9 @@ async function scrapeProductData(page) {
   return await page.evaluate((title) => {
     const cleanSpaces = (s) => (s || "").replace(/\s+/g, " ").trim();
     const stripMarks = (s) => (s || "").replace(/[\u200E\u200F\u061C]/g, "");
+    const stripPunct = (s) => (s || "").replace(/[:\-–—]+/g, " ");
     const cleanText = (s) => cleanSpaces(stripMarks(s));
+    const normLabel = (s) => cleanSpaces(stripPunct(stripMarks((s || "").toLowerCase())));
 
     // -------- Item Form --------
     const itemForm = (() => {
@@ -646,8 +648,7 @@ async function scrapeProductData(page) {
 
     additionalImageUrls = [...new Set(additionalImageUrls)];
 
-    // -------- New Fields --------
-    // Number of User reviews: from #acrCustomerReviewText, digits only
+    // -------- Reviews count --------
     const reviewCount = (() => {
       const el = document.querySelector("#acrCustomerReviewText");
       if (!el) return "";
@@ -656,7 +657,7 @@ async function scrapeProductData(page) {
       return digits || "";
     })();
 
-    // Product Rating/Star: from #acrPopover@title → strip "out of 5 stars"
+    // -------- Rating (stars) --------
     const rating = (() => {
       const el = document.querySelector("#acrPopover");
       const t = el?.getAttribute("title") || el?.getAttribute("aria-label") || "";
@@ -664,42 +665,107 @@ async function scrapeProductData(page) {
       return cleanSpaces(t.replace(/out of 5 stars/i, ""));
     })();
 
-    // Date First Available: in #detailBullets_feature_div label/value spans
+    // -------- Date First Available + fallback to Release date --------
     const dateFirstAvailable = (() => {
+      // 1) Preferred: #detailBullets_feature_div → bold label span → next *visible* sibling span text
       const container = document.querySelector("#detailBullets_feature_div");
-      const spans = container ? Array.from(container.querySelectorAll("span")) : [];
-      // Scan for label span
-      for (let i = 0; i < spans.length; i++) {
-        const label = cleanText(spans[i].innerText || spans[i].textContent || "");
-        if (/^date\s*first\s*available/i.test(label)) {
-          // Next non-empty span is the value
-          for (let j = i + 1; j < spans.length; j++) {
-            const val = cleanText(spans[j].innerText || spans[j].textContent || "");
+      const getNextSpanValue = (labelSpan) => {
+        if (!labelSpan) return "";
+        // Try the immediate next sibling spans within the same list item/container
+        let sib = labelSpan.nextElementSibling;
+        while (sib) {
+          const txt = cleanText(sib.innerText || sib.textContent || "");
+          if (txt) return txt;
+          sib = sib.nextElementSibling;
+        }
+        // Fallback: any non-bold span in the same parent (common structure: two spans)
+        const parent = labelSpan.parentElement;
+        if (parent) {
+          const nonBold = Array.from(parent.querySelectorAll("span:not(.a-text-bold)"))
+            .map((s) => cleanText(s.innerText || s.textContent || ""))
+            .find((s) => !!s);
+          if (nonBold) return nonBold;
+        }
+        return "";
+      };
+
+      if (container) {
+        // Scan all bold spans under the bullets container
+        const bolds = Array.from(container.querySelectorAll("span.a-text-bold, span"))
+          .filter((s) => /a-text-bold/.test(s.className || "") || /:/.test(s.textContent || ""));
+        for (const b of bolds) {
+          const label = normLabel(b.innerText || b.textContent || "");
+          // normalize e.g. "date first available :"
+          if (/^date\s*first\s*available\b/i.test(label)) {
+            const val = getNextSpanValue(b);
             if (val) return val;
           }
         }
-      }
-      // Fallback: entire list item text
-      const li = Array.from(document.querySelectorAll("#detailBullets_feature_div li, li")).find((el) =>
-        /date\s*first\s*available/i.test(el.innerText || el.textContent || "")
-      );
-      if (li) {
-        const raw = cleanText(li.innerText || li.textContent || "");
-        const m = raw.match(/date\s*first\s*available\s*[:\-]?\s*(.+)$/i);
-        if (m && m[1]) return cleanText(m[1]);
-      }
-      // Fallback: tables in product details
-      const ths = Array.from(
-        document.querySelectorAll(
-          "#productDetails_detailBullets_sections1 th, #productDetails_techSpec_section_1 th, #productDetails_techSpec_section_2 th"
-        )
-      );
-      for (const th of ths) {
-        if (/date\s*first\s*available/i.test(th.textContent || "")) {
-          const td = th.nextElementSibling;
-          if (td) return cleanText(td.textContent || "");
+        // As a secondary attempt, parse whole li text lines
+        const item = Array.from(container.querySelectorAll("li")).find((li) =>
+          /date\s*first\s*available/i.test(li.innerText || li.textContent || "")
+        );
+        if (item) {
+          const raw = cleanText(item.innerText || item.textContent || "");
+          const m = raw.match(/date\s*first\s*available\s*[:\-]?\s*(.+)$/i);
+          if (m && m[1]) {
+            const candidate = cleanText(m[1]);
+            if (candidate) return candidate;
+          }
         }
       }
+
+      // 2) Fallback: classic product details tables (including #prodDetails)
+      const detailsRoots = [
+        document.querySelector("#prodDetails"),
+        document.querySelector("#productDetails_detailBullets_sections1"),
+        document.querySelector("#productDetails_techSpec_section_1"),
+        document.querySelector("#productDetails_techSpec_section_2"),
+      ].filter(Boolean);
+
+      const isReleaseLabel = (txt) => {
+        const n = normLabel(txt);
+        // match "release date", "released date", "date of release", "date released", etc.
+        return (
+          /\brelease\s*date\b/i.test(n) ||
+          /\breleased\s*date\b/i.test(n) ||
+          /\bdate\s*released\b/i.test(n) ||
+          /\bdate\s*of\s*release\b/i.test(n)
+        );
+      };
+
+      const isFirstAvailLabel = (txt) => /^date\s*first\s*available\b/i.test(normLabel(txt));
+
+      for (const root of detailsRoots) {
+        const rows = Array.from(root.querySelectorAll("tr"));
+        for (const tr of rows) {
+          const th = tr.querySelector("th");
+          const td = tr.querySelector("td");
+          if (!th || !td) continue;
+
+          const thText = cleanText(th.innerText || th.textContent || "");
+          const tdText = cleanText(td.innerText || td.textContent || "");
+          if (!tdText) continue;
+
+          // Prefer exact "Date First Available" if present in tables
+          if (isFirstAvailLabel(thText)) return tdText;
+
+          // Otherwise accept Release date variants as fallback
+          if (isReleaseLabel(thText)) return tdText;
+        }
+      }
+
+      // 3) Last-chance: scan any definition lists or spans for release/date labels
+      const genericRows = Array.from(
+        document.querySelectorAll("#prodDetails th, #prodDetails td, th, td, dt, dd")
+      );
+      for (let i = 0; i < genericRows.length - 1; i++) {
+        const label = cleanText(genericRows[i].innerText || genericRows[i].textContent || "");
+        const value = cleanText(genericRows[i + 1].innerText || genericRows[i + 1].textContent || "");
+        if (!value) continue;
+        if (isFirstAvailLabel(label) || isReleaseLabel(label)) return value;
+      }
+
       return "";
     })();
 
@@ -720,7 +786,6 @@ async function scrapeProductData(page) {
 }
 
 /* ------------------ Detour detection + bounce (MAX_BOUNCES=3) -------------- */
-// Wait briefly for late redirects or DOM to settle; exit early if product or detour is detected
 async function waitForDetourOrProduct(page, settleMs = 3500) {
   const end = Date.now() + settleMs;
   let lastUrl = page.url();
@@ -728,7 +793,6 @@ async function waitForDetourOrProduct(page, settleMs = 3500) {
     const u = page.url();
     if (u !== lastUrl) { lastUrl = u; await sleep(150); }
     if (isLikelyDetourUrl(u) || isProductUrl(u)) return u;
-    // Treat visible inline "Continue/Keep shopping" as a detour signal too
     try {
       const hasInline = await hasInlineContinueShopping(page);
       if (hasInline) return u;
@@ -741,7 +805,6 @@ async function waitForDetourOrProduct(page, settleMs = 3500) {
   }
   return page.url();
 }
-// Try up to maxBounces to jump back to target; return updated page, attempts, and final URL
 async function detectAndBounceIfDetour(page, context, targetUrl, { maxBounces = 3, settleMs = 3500 } = {}) {
   let attempts = 0;
   let currentUrl = await waitForDetourOrProduct(page, settleMs);
@@ -783,8 +846,6 @@ async function hasInlineContinueShopping(page) {
     return false;
   });
 }
-
-// Dismiss Continue/Keep Shopping once (inline or popover) and wait for settle
 async function dismissContinueShoppingOnce(page, context, fallbackUrl) {
   const clicked = await clickContinueShoppingIfPresent(page);
   if (!clicked) return false;
@@ -802,8 +863,6 @@ async function dismissContinueShoppingOnce(page, context, fallbackUrl) {
   }
   return true;
 }
-
-// Loop: make the page "product-ready" by dismissing Continue/Keep Shopping up to maxRounds
 async function ensureProductReady(page, context, targetUrl, { maxRounds = 3, settleMs = 1200 } = {}) {
   for (let round = 0; round < maxRounds; round++) {
     if (await isProductPage(page)) break;
@@ -853,7 +912,7 @@ app.get("/scrape", async (req, res) => {
     await safeGoto(page, originalUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Early overlay cleanup (some detours are overlay-triggered)
+    // Early overlay cleanup
     page = await handleContinueShopping(page, context, targetUrl);
     ensureAlive(page, "Page closed after continue-shopping handling (reloaded)");
 
@@ -903,7 +962,7 @@ app.get("/scrape", async (req, res) => {
       });
     }
 
-    // Ensure product is "ready": dismiss inline/overlay Continue Shopping up to 3 rounds
+    // Ensure product is "ready"
     await ensureProductReady(page, context, targetUrl, { maxRounds: 3, settleMs: 1200 });
 
     // Confirm product-like DOM
@@ -1010,7 +1069,6 @@ app.get("/scrape", async (req, res) => {
       productDescription: scraped.productDescription || "Unspecified",
       mainImageUrl: scraped.mainImageUrl || "Unspecified",
       additionalImageUrls: scraped.additionalImageUrls || [],
-      // New fields:
       reviewCount: scraped.reviewCount || "Unspecified",
       rating: scraped.rating || "Unspecified",
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
