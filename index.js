@@ -511,52 +511,45 @@ async function scrapeProductData(page) {
     const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
-    /* -------- Additional Images: ONLY ImageBlockATF (hiRes first, fallback to large) -------- */
+    /* -------- Additional Images: ONLY ImageBlockATF (prefer hiRes; per-image fallback to large) -------- */
     const additionalImageUrls = (() => {
       const scripts = Array.from(document.querySelectorAll("script"));
-      const hiResUrls = new Set();
-      const largeUrls = new Set();
-
+    
       const unescapeUrl = (u) =>
         (u || "")
-          .replace(/\\\//g, "/")      // \/  -> /
-          .replace(/\\u002B/gi, "+")  // \u002B -> +
-          .replace(/&amp;/gi, "&")    // HTML ampersand
+          .replace(/\\\//g, "/")
+          .replace(/\\u002B/gi, "+")
+          .replace(/&amp;/gi, "&")
           .trim();
-
+    
       const isUseful = (u) => {
         if (!u) return false;
         const lower = u.toLowerCase();
-        // Only Amazon media CDN; drop tiny thumbs & sprites/overlays
         if (!/https?:\/\/(?:m\.)?media-amazon\.com\/images\//i.test(u)) return false;
         if (/_US40_|sprite|play-icon|overlay|360_icon|fmjpg|fmpng/i.test(lower)) return false;
         return /\.(jpg|jpeg|png|webp)(\?|$)/i.test(u);
       };
-
+    
+      const urls = new Set();
+    
       for (const s of scripts) {
         const txt = s.textContent || "";
         if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
-
-        // collect hiRes entries
-        for (const m of txt.matchAll(/["']hiRes["']\s*:\s*(?:["'](https?:[^"']+)["']|null)/gi)) {
-          const url = unescapeUrl(m[1] || "");
-          if (isUseful(url)) hiResUrls.add(url.split("?")[0]);
-        }
-        // collect large entries (used only if no hiRes for that image)
-        for (const m of txt.matchAll(/["']large["']\s*:\s*["'](https?:[^"']+)["']/gi)) {
-          const url = unescapeUrl(m[1] || "");
-          if (isUseful(url)) largeUrls.add(url.split("?")[0]);
+    
+        // Iterate per image object and capture its hiRes and large together
+        // For each object: use hiRes if present; otherwise use large.
+        const objRe = /{\s*[^{}]*?"hiRes"\s*:\s*(?:["'](https?:[^"']+)["']|null)[\s\S]*?"large"\s*:\s*["'](https?:[^"']+)["'][\s\S]*?}/gi;
+        let m;
+        while ((m = objRe.exec(txt)) !== null) {
+          const hi = unescapeUrl(m[1] || "");
+          const lg = unescapeUrl(m[2] || "");
+          const chosen = isUseful(hi) ? hi : (isUseful(lg) ? lg : "");
+          if (chosen) urls.add(chosen.split("?")[0]);
         }
       }
-
-      // Prefer all hiRes; then add large that aren’t already covered
-      const all = new Set();
-      for (const u of hiResUrls) if (u) all.add(u);
-      for (const u of largeUrls) if (u && !all.has(u)) all.add(u);
-
+    
       // Don’t echo the normalized main image in the gallery
-      const out = Array.from(all).filter((u) => u !== normalizedMain);
-      return out;
+      return Array.from(urls).filter((u) => u !== normalizedMain);
     })();
 
     // Final date: prefer Date First Available, else Release date
