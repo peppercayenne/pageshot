@@ -460,6 +460,7 @@ async function scrapeProductData(page) {
       const bold = li.querySelector("span.a-text-bold");
       if (bold) {
         let sib = bold.nextElementSibling;
+        // skip RTL/LRM spans that are just punctuation
         while (sib && sib.tagName?.toLowerCase() === "span" && !DATE_RE.test(sib.textContent || "")) {
           sib = sib.nextElementSibling;
         }
@@ -468,7 +469,7 @@ async function scrapeProductData(page) {
         if (m) return m[0];
       }
 
-      // 2) Fallback: any non-bold span containing a valid date
+      // 2) Fallback: look at all non-bold spans inside this <li>
       const spans = Array.from(li.querySelectorAll("span")).filter((s) => !s.classList.contains("a-text-bold"));
       for (const s of spans) {
         const t = (s.innerText || s.textContent || "").trim();
@@ -476,7 +477,7 @@ async function scrapeProductData(page) {
         if (m) return m[0];
       }
 
-      // 3) Final fallback: whole li
+      // 3) Final fallback: extract from the whole <li> text
       const full = (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim();
       const m = full.match(DATE_RE);
       return (m && m[0]) || "";
@@ -494,7 +495,7 @@ async function scrapeProductData(page) {
         const label = (th.innerText || th.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
         if (/release\s*date|date\s*released|date\s*of\s*release/i.test(label)) {
           const val = (td.innerText || td.textContent || "").replace(/\s+/g, " ").trim();
-          const m = val.match(/\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?)\s+\d{1,2},\s+\d{4}\b/);
+          const m = val.match(/\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}\b/);
           return (m && m[0]) || val;
         }
       }
@@ -510,60 +511,51 @@ async function scrapeProductData(page) {
     const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
-    /* -------- Additional Images: ONLY from ImageBlockATF — hiRes then large -------- */
+    /* -------- Additional Images: ONLY ImageBlockATF (hiRes first, fallback to large) -------- */
     const additionalImageUrls = (() => {
       const scripts = Array.from(document.querySelectorAll("script"));
-      const out = [];
-      const seen = new Set();
-      const push = (u) => {
-        if (!u) return;
-        try {
-          const abs = new URL(u, location.href).href.split("?")[0];
-          if (abs && abs !== normalizedMain && !seen.has(abs)) {
-            seen.add(abs);
-            out.push(abs);
-          }
-        } catch {}
+      const hiResUrls = new Set();
+      const largeUrls = new Set();
+
+      const unescapeUrl = (u) =>
+        (u || "")
+          .replace(/\\\//g, "/")      // \/  -> /
+          .replace(/\\u002B/gi, "+")  // \u002B -> +
+          .replace(/&amp;/gi, "&")    // HTML ampersand
+          .trim();
+
+      const isUseful = (u) => {
+        if (!u) return false;
+        const lower = u.toLowerCase();
+        // Only Amazon media CDN; drop tiny thumbs & sprites/overlays
+        if (!/https?:\/\/(?:m\.)?media-amazon\.com\/images\//i.test(u)) return false;
+        if (/_US40_|sprite|play-icon|overlay|360_icon|fmjpg|fmpng/i.test(lower)) return false;
+        return /\.(jpg|jpeg|png|webp)(\?|$)/i.test(u);
       };
 
       for (const s of scripts) {
         const txt = s.textContent || "";
-        if (!/register\(\s*["']ImageBlockATF["']\s*,/.test(txt)) continue;
+        if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
 
-        // Pull the body of colorImages.initial: [ ... ]
-        const mArr = txt.match(/colorImages\s*:\s*\{\s*initial\s*:\s*\[([\s\S]*?)\]/);
-        if (!mArr) continue;
-        const initialBody = mArr[1];
-
-        // Chunk items by splitting on "},{" boundaries (best-effort)
-        const chunks = initialBody.split(/\}\s*,\s*\{/g);
-        for (let raw of chunks) {
-          if (!raw.trim().startsWith("{")) raw = "{" + raw;
-          if (!raw.trim().endsWith("}")) raw = raw + "}";
-
-          let hiRes = null, large = null;
-
-          // Double-quoted
-          let m = raw.match(/(?:^|[,{]\s*)["']?hiRes["']?\s*:\s*"([^"]*)"/i);
-          if (m && m[1]) hiRes = m[1].trim();
-          m = raw.match(/(?:^|[,{]\s*)["']?large["']?\s*:\s*"([^"]*)"/i);
-          if (m && m[1]) large = m[1].trim();
-
-          // Single-quoted fallbacks
-          if (!hiRes) {
-            m = raw.match(/(?:^|[,{]\s*)["']?hiRes["']?\s*:\s*'([^']*)'/i);
-            if (m && m[1]) hiRes = m[1].trim();
-          }
-          if (!large) {
-            m = raw.match(/(?:^|[,{]\s*)["']?large["']?\s*:\s*'([^']*)'/i);
-            if (m && m[1]) large = m[1].trim();
-          }
-
-          if (hiRes) push(hiRes);
-          else if (large) push(large);
+        // collect hiRes entries
+        for (const m of txt.matchAll(/["']hiRes["']\s*:\s*(?:["'](https?:[^"']+)["']|null)/gi)) {
+          const url = unescapeUrl(m[1] || "");
+          if (isUseful(url)) hiResUrls.add(url.split("?")[0]);
+        }
+        // collect large entries (used only if no hiRes for that image)
+        for (const m of txt.matchAll(/["']large["']\s*:\s*["'](https?:[^"']+)["']/gi)) {
+          const url = unescapeUrl(m[1] || "");
+          if (isUseful(url)) largeUrls.add(url.split("?")[0]);
         }
       }
 
+      // Prefer all hiRes; then add large that aren’t already covered
+      const all = new Set();
+      for (const u of hiResUrls) if (u) all.add(u);
+      for (const u of largeUrls) if (u && !all.has(u)) all.add(u);
+
+      // Don’t echo the normalized main image in the gallery
+      const out = Array.from(all).filter((u) => u !== normalizedMain);
       return out;
     })();
 
