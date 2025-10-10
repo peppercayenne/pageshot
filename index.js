@@ -132,15 +132,33 @@ function isLikelyDetourUrl(u = "") {
   );
 }
 
+/* ----------------------- Ready signals (micro-tuning) ---------------------- */
+async function waitForProductReady(page, timeoutMs = 2500) {
+  // Return once we see a title or a canonical /dp/ URL; otherwise time out
+  await Promise.race([
+    page.waitForSelector('#productTitle, #titleSection #title', { state: 'visible', timeout: timeoutMs }).catch(() => null),
+    page.waitForURL(/\/dp\/[A-Z0-9]{8,10}/i, { timeout: timeoutMs }).catch(() => null),
+  ]);
+}
+
 /* ---------------------------- Navigation helpers -------------------------- */
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let attempt = 0;
   let lastErr;
   while (attempt <= retries) {
     try {
-      await sleep(jitter(250, 500));
+      // trimmed pre-goto jitter (120–320 ms)
+      await sleep(jitter(120, 200));
+
       await page.goto(url, { timeout, waitUntil: "commit" });
-      await sleep(jitter(700, 600));
+
+      // micro-tuned settle: wait for a quick UI/URL signal, else small fallback sleep (300–700 ms)
+      await Promise.race([
+        page.waitForSelector('#productTitle, #ppd, #centerCol, #leftCol', { timeout: 1200 }).catch(() => null),
+        page.waitForURL(/\/dp\/[A-Z0-9]{8,10}|\/hz\/mobile\/mission|\/ap\/signin/i, { timeout: 1200 }).catch(() => null),
+        sleep(jitter(300, 400)), // 300–700ms fallback
+      ]);
+
       if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
       return;
     } catch (err) {
@@ -258,9 +276,11 @@ async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
     await Promise.race([
       page.waitForNavigation({ waitUntil: "commit", timeout: 4000 }).catch(() => null),
       page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => null),
+      page.waitForSelector('#productTitle, #titleSection #title', { state: 'visible', timeout: 2500 }).catch(() => null),
+      page.waitForURL(/\/dp\/[A-Z0-9]{8,10}/i, { timeout: 2500 }).catch(() => null),
     ]);
     if (await hasProductTitle(page)) return true;
-    if (!clicked) await sleep(350);
+    if (!clicked) await sleep(200);
   }
   return false;
 }
@@ -273,7 +293,11 @@ async function handleContinueShopping(page, context, fallbackUrl, onClick) {
     const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
     const navPromise = page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }).catch(() => null);
     const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => null);
-    await Promise.race([popupPromise, navPromise, dclPromise]);
+    // Early-exit signals
+    const titlePromise = page.waitForSelector('#productTitle, #titleSection #title', { state: 'visible', timeout: 3000 }).catch(() => null);
+    const urlPromise = page.waitForURL(/\/dp\/[A-Z0-9]{8,10}/i, { timeout: 3000 }).catch(() => null);
+
+    await Promise.race([popupPromise, navPromise, dclPromise, titlePromise, urlPromise]);
 
     const pages = context.pages();
     const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
@@ -537,7 +561,6 @@ async function scrapeProductData(page) {
         if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
     
         // Iterate per image object and capture its hiRes and large together
-        // For each object: use hiRes if present; otherwise use large.
         const objRe = /{\s*[^{}]*?"hiRes"\s*:\s*(?:["'](https?:[^"']+)["']|null)[\s\S]*?"large"\s*:\s*["'](https?:[^"']+)["'][\s\S]*?}/gi;
         let m;
         while ((m = objRe.exec(txt)) !== null) {
@@ -594,11 +617,9 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   if (!/\d\.\d{2,}/.test(s) && /(\d+)\s+(\d{2})\b/.test(s)) s = s.replace(/(\d+)\s+(\d{2})\b/, "$1.$2");
   if (hadSuper && !/\d\.\d{2,}/.test(s)) {
     const digits = (s.match(/\d+/g) || []).join("");
-    if (digits.length >= 3) {
-      const num = `${digits.slice(0, -2)}.${digits.slice(-2)}`;
-      const cur = currencyToken(s) || currencyToken(domPrice);
-      s = cur ? `${cur} ${num}` : num;
-    }
+    const num = digits.length >= 3 ? `${digits.slice(0, -2)}.${digits.slice(-2)}` : digits;
+    const cur = currencyToken(s) || currencyToken(domPrice);
+    s = cur ? `${cur} ${num}` : num;
   }
   if (!includesCurrency(s) && includesCurrency(domPrice)) {
     const cur = currencyToken(domPrice);
@@ -665,17 +686,18 @@ app.get("/scrape", async (req, res) => {
     await safeGoto(page, inputUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Bounce back to dp if detoured (with small settle delay)
+    // Bounce back to dp if detoured (replace fixed settle with ready signal)
     const bounceBackToDp = async () => {
       if (!intendedDpUrl) return;
       for (let i = 0; i < MAX_DETOUR_BOUNCES; i++) {
-        await sleep(300);
+        await waitForProductReady(page, 1500);
         const curUrl = page.url();
         if (isDpUrl(curUrl)) break;
         if (isLikelyDetourUrl(curUrl) || !isDpUrl(curUrl)) {
           detourBounceAttempts++;
           await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
           page = await handleContinueShopping(page, context, intendedDpUrl, null);
+          await waitForProductReady(page, 2000);
           if (await hasProductTitle(page)) break;
         } else {
           break;
@@ -696,6 +718,7 @@ app.get("/scrape", async (req, res) => {
         detourBounceAttempts++;
         await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
         page = await handleContinueShopping(page, context, intendedDpUrl, null);
+        await waitForProductReady(page, 2000);
         productLike = await isProductPage(page);
       }
     }
@@ -722,7 +745,7 @@ app.get("/scrape", async (req, res) => {
       });
     }
 
-    // Handle any “continue shopping” loops inline
+    // Handle any “continue shopping” loops inline (early-exit if we see signals)
     for (let i = 0; i < 3; i++) {
       const before = page.url();
       const handled = await clickContinueShoppingIfPresent(page);
@@ -730,13 +753,16 @@ app.get("/scrape", async (req, res) => {
       await Promise.race([
         page.waitForNavigation({ waitUntil: "commit", timeout: 8000 }).catch(() => null),
         page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => null),
+        page.waitForSelector('#productTitle, #titleSection #title', { state: 'visible', timeout: 3000 }).catch(() => null),
+        page.waitForURL(/\/dp\/[A-Z0-9]{8,10}/i, { timeout: 3000 }).catch(() => null),
       ]);
       const after = page.url();
       if (await hasProductTitle(page)) break;
-      if (after === before) await sleep(350);
+      if (after === before) await sleep(200);
     }
 
-    await sleep(jitter(300, 400));
+    // Replace last blind settle with a ready signal
+    await waitForProductReady(page, 2000);
 
     // Scrape DOM
     let scraped;
@@ -768,7 +794,7 @@ app.get("/scrape", async (req, res) => {
     const base64 = buf.toString("base64");
 
     // OCR brand + price
-    const gem = await geminiExtract(base64);
+    const gem = await model ? await geminiExtract(base64) : { brand: "Unspecified", price: "Unspecified" };
     const priceGemini = normalizeGeminiPrice(gem.price, scraped.price);
 
     // ASIN from final URL (or input as fallback)
