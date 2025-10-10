@@ -132,13 +132,51 @@ function isLikelyDetourUrl(u = "") {
   );
 }
 
-/* ----------------------- Ready signals (micro-tuning) ---------------------- */
-async function waitForProductReady(page, timeoutMs = 2500) {
-  // Return once we see a title or a canonical /dp/ URL; otherwise time out
-  await Promise.race([
-    page.waitForSelector('#productTitle, #titleSection #title', { state: 'visible', timeout: timeoutMs }).catch(() => null),
-    page.waitForURL(/\/dp\/[A-Z0-9]{8,10}/i, { timeout: timeoutMs }).catch(() => null),
-  ]);
+/* --- Try to jump to the homepage via the header logo, then we can go back -- */
+async function tryGoHomeViaLogo(page) {
+  try {
+    // Prefer clicking an anchor inside the logo container if present
+    const candidates = [
+      '#nav-logo a',
+      'a#nav-logo-sprites',
+      '#nav-logo',
+      '#nav-logo-sprites'
+    ];
+    for (const sel of candidates) {
+      const loc = page.locator(sel).first();
+      if (await loc.isVisible({ timeout: 800 }).catch(() => false)) {
+        const prev = page.url();
+        await loc.click({ timeout: 2000 }).catch(() => {});
+        // Wait for a quick signal of homepage state
+        await Promise.race([
+          page.waitForNavigation({ waitUntil: "commit", timeout: 5000 }).catch(() => null),
+          page.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => null),
+        ]);
+        const now = page.url();
+        // Heuristic: homepage usually contains /ref=nav_logo or root "/"
+        if (now !== prev && /amazon\.com\/?(?:\?|$|ref=nav_logo)/i.test(now)) {
+          return true;
+        }
+        // If it didn't navigate, try a last-ditch: location assign (some headers are inert divs)
+        break;
+      }
+    }
+    // If clicking didn't work, try forcing location change in-page
+    const forced = await page.evaluate(() => {
+      try {
+        location.assign("https://www.amazon.com/ref=nav_logo");
+        return true;
+      } catch { return false; }
+    });
+    if (forced) {
+      await Promise.race([
+        page.waitForNavigation({ waitUntil: "commit", timeout: 6000 }).catch(() => null),
+        page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => null),
+      ]);
+      return true;
+    }
+  } catch {}
+  return false;
 }
 
 /* ---------------------------- Navigation helpers -------------------------- */
@@ -147,24 +185,17 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let lastErr;
   while (attempt <= retries) {
     try {
-      // trimmed pre-goto jitter (120–320 ms)
-      await sleep(jitter(120, 200));
-
+      // trimmed micro-jitter (helps evade flaky race conditions)
+      await sleep(jitter(120, 180));
       await page.goto(url, { timeout, waitUntil: "commit" });
-
-      // micro-tuned settle: wait for a quick UI/URL signal, else small fallback sleep (300–700 ms)
-      await Promise.race([
-        page.waitForSelector('#productTitle, #ppd, #centerCol, #leftCol', { timeout: 1200 }).catch(() => null),
-        page.waitForURL(/\/dp\/[A-Z0-9]{8,10}|\/hz\/mobile\/mission|\/ap\/signin/i, { timeout: 1200 }).catch(() => null),
-        sleep(jitter(300, 400)), // 300–700ms fallback
-      ]);
-
+      // trimmed settle delay
+      await sleep(jitter(220, 280));
       if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
       return;
     } catch (err) {
       lastErr = err;
       if (page.isClosed()) throw lastErr;
-      if (attempt < retries) await sleep(jitter(1000, 1500));
+      if (attempt < retries) await sleep(jitter(420, 580));
       attempt++;
     }
   }
@@ -256,9 +287,8 @@ async function clickContinueShoppingIfPresent(page) {
 
 async function hasProductTitle(page) {
   try {
-    return await page.evaluate(() => {
-      return !!(document.querySelector("#productTitle") || document.querySelector("#title"));
-    });
+    const ok = await page.locator("#productTitle, #title").first().isVisible({ timeout: 400 }).catch(() => false);
+    return !!ok;
   } catch {
     return false;
   }
@@ -276,11 +306,9 @@ async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
     await Promise.race([
       page.waitForNavigation({ waitUntil: "commit", timeout: 4000 }).catch(() => null),
       page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => null),
-      page.waitForSelector('#productTitle, #titleSection #title', { state: 'visible', timeout: 2500 }).catch(() => null),
-      page.waitForURL(/\/dp\/[A-Z0-9]{8,10}/i, { timeout: 2500 }).catch(() => null),
     ]);
     if (await hasProductTitle(page)) return true;
-    if (!clicked) await sleep(200);
+    if (!clicked) await sleep(250);
   }
   return false;
 }
@@ -290,14 +318,10 @@ async function handleContinueShopping(page, context, fallbackUrl, onClick) {
     const clicked = await clickContinueShoppingIfPresent(page);
     if (!clicked) return page;
 
-    const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
-    const navPromise = page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }).catch(() => null);
-    const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => null);
-    // Early-exit signals
-    const titlePromise = page.waitForSelector('#productTitle, #titleSection #title', { state: 'visible', timeout: 3000 }).catch(() => null);
-    const urlPromise = page.waitForURL(/\/dp\/[A-Z0-9]{8,10}/i, { timeout: 3000 }).catch(() => null);
-
-    await Promise.race([popupPromise, navPromise, dclPromise, titlePromise, urlPromise]);
+    const popupPromise = context.waitForEvent("page", { timeout: 6000 }).catch(() => null);
+    const navPromise = page.waitForNavigation({ timeout: 10000, waitUntil: "commit" }).catch(() => null);
+    const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => null);
+    await Promise.race([popupPromise, navPromise, dclPromise]);
 
     const pages = context.pages();
     const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
@@ -337,7 +361,7 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
         throw new Error("Screenshot failed: " + msg);
       }
       if (i < retries) {
-        await sleep(jitter(250, 500));
+        await sleep(jitter(200, 250));
         continue;
       }
       throw new Error("Screenshot failed: " + msg);
@@ -561,6 +585,7 @@ async function scrapeProductData(page) {
         if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
     
         // Iterate per image object and capture its hiRes and large together
+        // For each object: use hiRes if present; otherwise use large.
         const objRe = /{\s*[^{}]*?"hiRes"\s*:\s*(?:["'](https?:[^"']+)["']|null)[\s\S]*?"large"\s*:\s*["'](https?:[^"']+)["'][\s\S]*?}/gi;
         let m;
         while ((m = objRe.exec(txt)) !== null) {
@@ -617,9 +642,11 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   if (!/\d\.\d{2,}/.test(s) && /(\d+)\s+(\d{2})\b/.test(s)) s = s.replace(/(\d+)\s+(\d{2})\b/, "$1.$2");
   if (hadSuper && !/\d\.\d{2,}/.test(s)) {
     const digits = (s.match(/\d+/g) || []).join("");
-    const num = digits.length >= 3 ? `${digits.slice(0, -2)}.${digits.slice(-2)}` : digits;
-    const cur = currencyToken(s) || currencyToken(domPrice);
-    s = cur ? `${cur} ${num}` : num;
+    if (digits.length >= 3) {
+      const num = `${digits.slice(0, -2)}.${digits.slice(-2)}`;
+      const cur = currencyToken(s) || currencyToken(domPrice);
+      s = cur ? `${cur} ${num}` : num;
+    }
   }
   if (!includesCurrency(s) && includesCurrency(domPrice)) {
     const cur = currencyToken(domPrice);
@@ -686,18 +713,33 @@ app.get("/scrape", async (req, res) => {
     await safeGoto(page, inputUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Bounce back to dp if detoured (replace fixed settle with ready signal)
+    // Bounce back to dp if detoured (with homepage-hop for hz/mobile/mission)
     const bounceBackToDp = async () => {
       if (!intendedDpUrl) return;
       for (let i = 0; i < MAX_DETOUR_BOUNCES; i++) {
-        await waitForProductReady(page, 1500);
+        // Prefer fast product-title signal over fixed settle sleeps
+        if (await hasProductTitle(page) && isDpUrl(page.url())) break;
+
         const curUrl = page.url();
         if (isDpUrl(curUrl)) break;
-        if (isLikelyDetourUrl(curUrl) || !isDpUrl(curUrl)) {
+
+        if (isLikelyDetourUrl(curUrl)) {
           detourBounceAttempts++;
+
+          // Special case: if it's the mobile mission page, hop to homepage via logo first
+          if (/\/hz\/mobile\/mission/i.test(curUrl)) {
+            try {
+              await tryGoHomeViaLogo(page);
+              // no need to wait long; we will immediately navigate to the dp
+            } catch {}
+          }
+
           await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
+
+          // handle potential continue-shopping overlays
           page = await handleContinueShopping(page, context, intendedDpUrl, null);
-          await waitForProductReady(page, 2000);
+
+          // If we now see a title, we’re good
           if (await hasProductTitle(page)) break;
         } else {
           break;
@@ -716,9 +758,12 @@ app.get("/scrape", async (req, res) => {
     if (!productLike) {
       if (intendedDpUrl && detourBounceAttempts < MAX_DETOUR_BOUNCES) {
         detourBounceAttempts++;
+        // If we somehow landed on mission again, try home hop again
+        if (/\/hz\/mobile\/mission/i.test(page.url())) {
+          await tryGoHomeViaLogo(page).catch(() => {});
+        }
         await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
         page = await handleContinueShopping(page, context, intendedDpUrl, null);
-        await waitForProductReady(page, 2000);
         productLike = await isProductPage(page);
       }
     }
@@ -745,24 +790,22 @@ app.get("/scrape", async (req, res) => {
       });
     }
 
-    // Handle any “continue shopping” loops inline (early-exit if we see signals)
+    // Handle any “continue shopping” loops inline (fast-exit if title appears)
     for (let i = 0; i < 3; i++) {
       const before = page.url();
       const handled = await clickContinueShoppingIfPresent(page);
       if (!handled) break;
       await Promise.race([
-        page.waitForNavigation({ waitUntil: "commit", timeout: 8000 }).catch(() => null),
-        page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => null),
-        page.waitForSelector('#productTitle, #titleSection #title', { state: 'visible', timeout: 3000 }).catch(() => null),
-        page.waitForURL(/\/dp\/[A-Z0-9]{8,10}/i, { timeout: 3000 }).catch(() => null),
+        page.waitForNavigation({ waitUntil: "commit", timeout: 6000 }).catch(() => null),
+        page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => null),
       ]);
       const after = page.url();
       if (await hasProductTitle(page)) break;
-      if (after === before) await sleep(200);
+      if (after === before) await sleep(220);
     }
 
-    // Replace last blind settle with a ready signal
-    await waitForProductReady(page, 2000);
+    // Quick settle: if the title is visible, continue immediately
+    await page.locator("#productTitle, #title").first().isVisible({ timeout: 500 }).catch(() => {});
 
     // Scrape DOM
     let scraped;
@@ -771,7 +814,7 @@ app.get("/scrape", async (req, res) => {
     } catch (e) {
       if (isClosedErr(e)) {
         page = await adoptActivePageOrThrow(page, context);
-        await sleep(200);
+        await sleep(120);
         scraped = await scrapeProductData(page);
       } else {
         throw e;
@@ -794,7 +837,7 @@ app.get("/scrape", async (req, res) => {
     const base64 = buf.toString("base64");
 
     // OCR brand + price
-    const gem = await model ? await geminiExtract(base64) : { brand: "Unspecified", price: "Unspecified" };
+    const gem = await geminiExtract(base64);
     const priceGemini = normalizeGeminiPrice(gem.price, scraped.price);
 
     // ASIN from final URL (or input as fallback)
