@@ -132,70 +132,21 @@ function isLikelyDetourUrl(u = "") {
   );
 }
 
-/* --- Try to jump to the homepage via the header logo, then we can go back -- */
-async function tryGoHomeViaLogo(page) {
-  try {
-    // Prefer clicking an anchor inside the logo container if present
-    const candidates = [
-      '#nav-logo a',
-      'a#nav-logo-sprites',
-      '#nav-logo',
-      '#nav-logo-sprites'
-    ];
-    for (const sel of candidates) {
-      const loc = page.locator(sel).first();
-      if (await loc.isVisible({ timeout: 800 }).catch(() => false)) {
-        const prev = page.url();
-        await loc.click({ timeout: 2000 }).catch(() => {});
-        // Wait for a quick signal of homepage state
-        await Promise.race([
-          page.waitForNavigation({ waitUntil: "commit", timeout: 5000 }).catch(() => null),
-          page.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => null),
-        ]);
-        const now = page.url();
-        // Heuristic: homepage usually contains /ref=nav_logo or root "/"
-        if (now !== prev && /amazon\.com\/?(?:\?|$|ref=nav_logo)/i.test(now)) {
-          return true;
-        }
-        // If it didn't navigate, try a last-ditch: location assign (some headers are inert divs)
-        break;
-      }
-    }
-    // If clicking didn't work, try forcing location change in-page
-    const forced = await page.evaluate(() => {
-      try {
-        location.assign("https://www.amazon.com/ref=nav_logo");
-        return true;
-      } catch { return false; }
-    });
-    if (forced) {
-      await Promise.race([
-        page.waitForNavigation({ waitUntil: "commit", timeout: 6000 }).catch(() => null),
-        page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => null),
-      ]);
-      return true;
-    }
-  } catch {}
-  return false;
-}
-
 /* ---------------------------- Navigation helpers -------------------------- */
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let attempt = 0;
   let lastErr;
   while (attempt <= retries) {
     try {
-      // trimmed micro-jitter (helps evade flaky race conditions)
-      await sleep(jitter(120, 180));
+      await sleep(jitter(250, 500));
       await page.goto(url, { timeout, waitUntil: "commit" });
-      // trimmed settle delay
-      await sleep(jitter(220, 280));
+      await sleep(jitter(700, 600));
       if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
       return;
     } catch (err) {
       lastErr = err;
       if (page.isClosed()) throw lastErr;
-      if (attempt < retries) await sleep(jitter(420, 580));
+      if (attempt < retries) await sleep(jitter(1000, 1500));
       attempt++;
     }
   }
@@ -287,16 +238,19 @@ async function clickContinueShoppingIfPresent(page) {
 
 async function hasProductTitle(page) {
   try {
-    const ok = await page.locator("#productTitle, #title").first().isVisible({ timeout: 400 }).catch(() => false);
-    return !!ok;
+    return await page.evaluate(() => {
+      return !!(document.querySelector("#productTitle") || document.querySelector("#title"));
+    });
   } catch {
     return false;
   }
 }
 
 // EXACT request fallback: click literal "Continue Shopping" up to maxTries
-async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
+async function trySimpleContinueShoppingFallback(page, maxTries = 3, opts = {}) {
+  const { onAttempt, onClick } = opts || {};
   for (let i = 0; i < maxTries; i++) {
+    onAttempt?.(); // count this attempt regardless of success
     let clicked = false;
     try {
       await page.click("text=Continue Shopping", { timeout: 1500 });
@@ -308,19 +262,21 @@ async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
       page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => null),
     ]);
     if (await hasProductTitle(page)) return true;
-    if (!clicked) await sleep(250);
+    if (!clicked) await sleep(350);
   }
   return false;
 }
 
-async function handleContinueShopping(page, context, fallbackUrl, onClick) {
+async function handleContinueShopping(page, context, fallbackUrl, opts = {}) {
+  const { onAttempt, onClick } = opts || {};
+  onAttempt?.(); // count entering this handler as one attempt
   try {
     const clicked = await clickContinueShoppingIfPresent(page);
     if (!clicked) return page;
 
-    const popupPromise = context.waitForEvent("page", { timeout: 6000 }).catch(() => null);
-    const navPromise = page.waitForNavigation({ timeout: 10000, waitUntil: "commit" }).catch(() => null);
-    const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => null);
+    const popupPromise = context.waitForEvent("page", { timeout: 8000 }).catch(() => null);
+    const navPromise = page.waitForNavigation({ timeout: 15000, waitUntil: "commit" }).catch(() => null);
+    const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 15000 }).catch(() => null);
     await Promise.race([popupPromise, navPromise, dclPromise]);
 
     const pages = context.pages();
@@ -361,7 +317,7 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
         throw new Error("Screenshot failed: " + msg);
       }
       if (i < retries) {
-        await sleep(jitter(200, 250));
+        await sleep(jitter(250, 500));
         continue;
       }
       throw new Error("Screenshot failed: " + msg);
@@ -504,11 +460,9 @@ async function scrapeProductData(page) {
 
       const DATE_RE = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}\b/;
 
-      // 1) Ideal case: bold label span → take its next sibling span’s text
       const bold = li.querySelector("span.a-text-bold");
       if (bold) {
         let sib = bold.nextElementSibling;
-        // skip RTL/LRM spans that are just punctuation
         while (sib && sib.tagName?.toLowerCase() === "span" && !DATE_RE.test(sib.textContent || "")) {
           sib = sib.nextElementSibling;
         }
@@ -517,7 +471,6 @@ async function scrapeProductData(page) {
         if (m) return m[0];
       }
 
-      // 2) Fallback: look at all non-bold spans inside this <li>
       const spans = Array.from(li.querySelectorAll("span")).filter((s) => !s.classList.contains("a-text-bold"));
       for (const s of spans) {
         const t = (s.innerText || s.textContent || "").trim();
@@ -525,7 +478,6 @@ async function scrapeProductData(page) {
         if (m) return m[0];
       }
 
-      // 3) Final fallback: extract from the whole <li> text
       const full = (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim();
       const m = full.match(DATE_RE);
       return (m && m[0]) || "";
@@ -585,7 +537,6 @@ async function scrapeProductData(page) {
         if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
     
         // Iterate per image object and capture its hiRes and large together
-        // For each object: use hiRes if present; otherwise use large.
         const objRe = /{\s*[^{}]*?"hiRes"\s*:\s*(?:["'](https?:[^"']+)["']|null)[\s\S]*?"large"\s*:\s*["'](https?:[^"']+)["'][\s\S]*?}/gi;
         let m;
         while ((m = objRe.exec(txt)) !== null) {
@@ -701,7 +652,10 @@ app.get("/scrape", async (req, res) => {
 
   let browser, context, page;
   let detourBounceAttempts = 0;
+  let continueShoppingAttempts = 0; // NEW: track attempts to handle "Continue shopping"
   const MAX_DETOUR_BOUNCES = 3;
+
+  const incContinue = () => { continueShoppingAttempts++; };
 
   try {
     const ctx = await minimalContext(width, height);
@@ -713,33 +667,26 @@ app.get("/scrape", async (req, res) => {
     await safeGoto(page, inputUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Bounce back to dp if detoured (with homepage-hop for hz/mobile/mission)
+    // Bounce back to dp if detoured (with small settle delay)
     const bounceBackToDp = async () => {
       if (!intendedDpUrl) return;
       for (let i = 0; i < MAX_DETOUR_BOUNCES; i++) {
-        // Prefer fast product-title signal over fixed settle sleeps
-        if (await hasProductTitle(page) && isDpUrl(page.url())) break;
-
+        // settle using title if possible
+        try {
+          await Promise.race([
+            page.waitForSelector("#productTitle", { timeout: 1200 }).catch(() => null),
+            sleep(300),
+          ]);
+        } catch {}
         const curUrl = page.url();
         if (isDpUrl(curUrl)) break;
-
-        if (isLikelyDetourUrl(curUrl)) {
+        if (isLikelyDetourUrl(curUrl) || !isDpUrl(curUrl)) {
           detourBounceAttempts++;
-
-          // Special case: if it's the mobile mission page, hop to homepage via logo first
-          if (/\/hz\/mobile\/mission/i.test(curUrl)) {
-            try {
-              await tryGoHomeViaLogo(page);
-              // no need to wait long; we will immediately navigate to the dp
-            } catch {}
-          }
-
           await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
-
-          // handle potential continue-shopping overlays
-          page = await handleContinueShopping(page, context, intendedDpUrl, null);
-
-          // If we now see a title, we’re good
+          page = await handleContinueShopping(page, context, intendedDpUrl, { onAttempt: incContinue });
+          try {
+            await page.waitForSelector("#productTitle", { timeout: 1500 }).catch(() => null);
+          } catch {}
           if (await hasProductTitle(page)) break;
         } else {
           break;
@@ -750,7 +697,7 @@ app.get("/scrape", async (req, res) => {
 
     // If on /dp/ but no title yet, simple fallback
     if (isDpUrl(page.url()) && !(await hasProductTitle(page))) {
-      await trySimpleContinueShoppingFallback(page, 3, null);
+      await trySimpleContinueShoppingFallback(page, 3, { onAttempt: incContinue });
     }
 
     // Final product check; if not product after bounces, return nonProduct JSON
@@ -758,12 +705,8 @@ app.get("/scrape", async (req, res) => {
     if (!productLike) {
       if (intendedDpUrl && detourBounceAttempts < MAX_DETOUR_BOUNCES) {
         detourBounceAttempts++;
-        // If we somehow landed on mission again, try home hop again
-        if (/\/hz\/mobile\/mission/i.test(page.url())) {
-          await tryGoHomeViaLogo(page).catch(() => {});
-        }
         await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
-        page = await handleContinueShopping(page, context, intendedDpUrl, null);
+        page = await handleContinueShopping(page, context, intendedDpUrl, { onAttempt: incContinue });
         productLike = await isProductPage(page);
       }
     }
@@ -786,26 +729,30 @@ app.get("/scrape", async (req, res) => {
         url: page.url() || returnUrl,
         pageType: "nonProduct",
         detourBounceAttempts,
+        continueShoppingAttempts, // NEW
         screenshot: base64NP,
       });
     }
 
-    // Handle any “continue shopping” loops inline (fast-exit if title appears)
+    // Handle any “continue shopping” loops inline (count each loop as an attempt)
     for (let i = 0; i < 3; i++) {
+      incContinue(); // we are attempting handling in this loop iteration
       const before = page.url();
       const handled = await clickContinueShoppingIfPresent(page);
       if (!handled) break;
       await Promise.race([
-        page.waitForNavigation({ waitUntil: "commit", timeout: 6000 }).catch(() => null),
-        page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => null),
+        page.waitForNavigation({ waitUntil: "commit", timeout: 8000 }).catch(() => null),
+        page.waitForLoadState("domcontentloaded", { timeout: 8000 }).catch(() => null),
       ]);
       const after = page.url();
       if (await hasProductTitle(page)) break;
-      if (after === before) await sleep(220);
+      if (after === before) await sleep(350);
     }
 
-    // Quick settle: if the title is visible, continue immediately
-    await page.locator("#productTitle, #title").first().isVisible({ timeout: 500 }).catch(() => {});
+    await Promise.race([
+      page.waitForSelector("#productTitle", { timeout: 1200 }).catch(() => null),
+      sleep(jitter(300, 400)),
+    ]);
 
     // Scrape DOM
     let scraped;
@@ -814,7 +761,7 @@ app.get("/scrape", async (req, res) => {
     } catch (e) {
       if (isClosedErr(e)) {
         page = await adoptActivePageOrThrow(page, context);
-        await sleep(120);
+        await sleep(200);
         scraped = await scrapeProductData(page);
       } else {
         throw e;
@@ -864,6 +811,7 @@ app.get("/scrape", async (req, res) => {
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
       screenshot: base64,
       detourBounceAttempts,
+      continueShoppingAttempts, // NEW
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err?.message || String(err) });
