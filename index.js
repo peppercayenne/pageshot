@@ -592,52 +592,78 @@ async function scrapeProductData(page) {
         rankingSecondary: "",
         secondaryCategory: ""
       };
+
+      /* Primary source: detailBullets (existing behavior) */
       const container = document.querySelector("#detailBullets_feature_div");
-      if (!container) return res;
+      if (container) {
+        const li = Array.from(container.querySelectorAll("li")).find((node) => {
+          const label = (node.querySelector("span.a-text-bold")?.innerText || node.innerText || node.textContent || "");
+          return /best\s*sellers?\s*rank/i.test(label);
+        });
 
-      // Find the <li> that contains "Best Sellers Rank"
-      const li = Array.from(container.querySelectorAll("li")).find((node) => {
-        const label = (node.querySelector("span.a-text-bold")?.innerText || node.innerText || node.textContent || "");
-        return /best\s*sellers?\s*rank/i.test(label);
-      });
-      if (!li) return res;
+        if (li) {
+          const holder = li.querySelector("span.a-list-item") || li;
+          const clone = holder.cloneNode(true);
+          const nested = clone.querySelector("ul.zg_hrsr");
+          if (nested) nested.remove();
 
-      // MAIN: clone to strip nested UL (sub-ranks) before extracting text
-      const holder = li.querySelector("span.a-list-item") || li;
-      const clone = holder.cloneNode(true);
-      const nested = clone.querySelector("ul.zg_hrsr");
-      if (nested) nested.remove();
+          const mainText = (clone.textContent || "").replace(/\s+/g, " ").trim();
+          let rankMain = firstHashRank(mainText) || fallbackRankBeforeIn(mainText);
+          const mainMatch = mainText.match(/#?\s*[\d,.\s]*\s*in\s+(.+?)(?:\s*\|\s*|\s*\(|$)/i);
+          const catMain = mainMatch ? mainMatch[1].trim() : "";
 
-      const mainText = (clone.textContent || "").replace(/\s+/g, " ").trim();
-      // Prefer "#<rank>" pattern
-      const firstHashRank = (text = "") => {
-        const m = (text || "").match(/#\s*([\d][\d,\s.]*)/);
-        return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
-      };
-      const fallbackRankBeforeIn = (text = "") => {
-        const m = (text || "").match(/\b(\d[\d,\s.]*)\s+in\b/i);
-        return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
-      };
-      let rankMain = firstHashRank(mainText);
-      if (!rankMain) rankMain = fallbackRankBeforeIn(mainText);
-      const mainMatch = mainText.match(/#?\s*[\d,.\s]*\s*in\s+(.+?)(?:\s*\|\s*|\s*\(|$)/i);
-      const catMain = mainMatch ? mainMatch[1].trim() : "";
+          if (rankMain) res.rankingMain = rankMain;
+          if (catMain)  res.mainCategory = catMain;
 
-      if (rankMain) res.rankingMain = rankMain;
-      if (catMain)  res.mainCategory = catMain;
+          const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
+          if (sub) {
+            const t = (sub.textContent || "").replace(/\s+/g, " ").trim();
+            const r2 = firstHashRank(t) || fallbackRankBeforeIn(t);
+            if (r2) res.rankingSecondary = r2;
+            const cat2 = cleanCategoryText(t);
+            if (cat2) res.secondaryCategory = cat2;
+          }
+        }
+      }
 
-      // SECONDARY: first sub-rank inside ul.zg_hrsr
-      const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
-      if (sub) {
-        const t = (sub.textContent || "").replace(/\s+/g, " ").trim();
-        const r2 = firstHashRank(t) || fallbackRankBeforeIn(t);
-        if (r2) res.rankingSecondary = r2;
-        const cleanCategoryText = (text = "") => {
-          const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
-          return afterIn.split("(")[0].trim();
-        };
-        const cat2 = cleanCategoryText(t);
-        if (cat2) res.secondaryCategory = cat2;
+      /* Fallback source: productDetails table row (requested) */
+      if (!(res.rankingMain && res.mainCategory)) {
+        const table = document.querySelector("#productDetails_detailBullets_sections1");
+        if (table) {
+          const rows = Array.from(table.querySelectorAll("tr"));
+          const bsrRow = rows.find(tr => {
+            const th = tr.querySelector("th");
+            if (!th) return false;
+            const t = (th.innerText || th.textContent || "").trim().toLowerCase();
+            return t.includes("best sellers rank");
+          });
+
+          if (bsrRow) {
+            const td = bsrRow.querySelector("td");
+            if (td) {
+              const items = Array.from(td.querySelectorAll("ul li span.a-list-item, ul li, span.a-list-item"))
+                .map(n => (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim())
+                .filter(Boolean);
+
+              const parseItem = (txt = "") => {
+                const rank = firstHashRank(txt) || fallbackRankBeforeIn(txt);
+                const cat  = cleanCategoryText(txt);
+                return { rank, cat };
+              };
+
+              if (items[0]) {
+                const { rank, cat } = parseItem(items[0]);
+                if (!res.rankingMain && rank) res.rankingMain = rank;
+                if (!res.mainCategory && cat) res.mainCategory = cat;
+              }
+              if (items[1]) {
+                const { rank, cat } = parseItem(items[1]);
+                if (!res.rankingSecondary && rank) res.rankingSecondary = rank;
+                if (!res.secondaryCategory && cat) res.secondaryCategory = cat;
+              }
+            }
+          }
+        }
       }
 
       return res;
@@ -756,12 +782,12 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   let s = (raw || "").trim();
   if (!s) return "Unspecified";
   s = s.replace(/[\u00A0\u2009\u202F]/g, " ");
-  const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆⁷⁸⁹]/.test(s);
+  const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅⁶⁷⁸⁹]/.test(s);
   const map = {
     "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4",
     "⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
     "₀":"0","₁":"1","₂":"2","₃":"3","⁴":"4",
-    "₅":"5","₆":"6","₇":"7","₈":"8","₉":"9",
+    "₅":"5","⁶":"6","₇":"7","₈":"8","₉":"9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
   if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
