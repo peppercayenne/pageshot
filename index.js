@@ -174,21 +174,110 @@ async function tryGoHomeViaLogo(page) {
   return false;
 }
 
+/* ------------------------- Signal-based wait helpers ----------------------- */
+async function settledUrl(page, {
+  dcl = 8000,      // cap for DOMContentLoaded
+  idle = 2000,     // cap for network idle
+  titleCap = 1200, // cap for fast '#productTitle' signal
+} = {}) {
+  await Promise.race([
+    page.waitForLoadState("domcontentloaded", { timeout: dcl }).catch(() => {}),
+    page.waitForSelector("#productTitle, #title", { timeout: titleCap }).catch(() => {})
+  ]);
+  await Promise.race([
+    page.waitForLoadState("networkidle", { timeout: idle }).catch(() => {}),
+    page.waitForSelector("#productTitle, #title", { timeout: 400 }).catch(() => {})
+  ]);
+  return page.url();
+}
+
+async function waitForNavSignals(page, {
+  urlChange = true,
+  titleSel = "#productTitle, #title",
+  max = 8000,
+} = {}) {
+  const startUrl = page.url();
+  const waiters = [
+    page.waitForLoadState("domcontentloaded", { timeout: max }).catch(() => null),
+    page.waitForSelector(titleSel, { timeout: Math.min(1500, max) }).catch(() => null),
+    page.waitForURL(/\/hz\/mobile\/mission/i, { timeout: max }).catch(() => null),
+  ];
+  if (urlChange) {
+    waiters.push(
+      (async () => {
+        const t0 = Date.now();
+        while (Date.now() - t0 < max) {
+          if (page.url() !== startUrl) return true;
+          await page.waitForTimeout(80);
+        }
+        return null;
+      })()
+    );
+  }
+  await Promise.race(waiters);
+}
+
+async function gotoAndDetectDetour(page, url, {
+  timeout = 60000,
+  dpUrl,
+  onDetour,          // () => void
+} = {}) {
+  await page.goto(url, { timeout, waitUntil: "commit" });
+  await waitForNavSignals(page, { max: 6000 });
+  const final = await settledUrl(page);
+  if (/\/hz\/mobile\/mission/i.test(final)) {
+    onDetour?.();
+    try { await tryGoHomeViaLogo(page); } catch {}
+    if (dpUrl) {
+      await page.goto(dpUrl, { timeout, waitUntil: "commit" });
+      await waitForNavSignals(page, { max: 6000 });
+    }
+  }
+  if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
+  return page;
+}
+
+async function handleContinueShoppingFast(page, context, dpUrl, onDetour) {
+  const clicked = await clickContinueShoppingIfPresent(page);
+  if (!clicked) return page;
+
+  await Promise.race([
+    waitForNavSignals(page, { max: 6000 }),
+    context.waitForEvent("page", { timeout: 6000 }).catch(() => null),
+  ]);
+
+  const u = page.url();
+  if (/\/hz\/mobile\/mission/i.test(u)) {
+    onDetour?.();
+    try { await tryGoHomeViaLogo(page); } catch {}
+    if (dpUrl) {
+      await page.goto(dpUrl, { waitUntil: "commit" });
+      await waitForNavSignals(page, { max: 6000 });
+    }
+  }
+
+  const hasTitle = await page.locator("#productTitle, #title").first().isVisible({ timeout: 400 }).catch(() => false);
+  if (!hasTitle) {
+    await page.waitForTimeout(180).catch(() => {});
+  }
+  return page;
+}
+
 /* ---------------------------- Navigation helpers -------------------------- */
+// Kept for compatibility in a few places; now uses signal waits instead of blind sleeps
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let attempt = 0;
   let lastErr;
   while (attempt <= retries) {
     try {
-      await sleep(jitter(120, 180));
       await page.goto(url, { timeout, waitUntil: "commit" });
-      await sleep(jitter(220, 280));
+      await waitForNavSignals(page, { max: 6000 });
+      await settledUrl(page);
       if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
       return;
     } catch (err) {
       lastErr = err;
       if (page.isClosed()) throw lastErr;
-      if (attempt < retries) await sleep(jitter(420, 580));
       attempt++;
     }
   }
@@ -301,44 +390,8 @@ async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
       page.waitForLoadState("domcontentloaded", { timeout: 4000 }).catch(() => null),
     ]);
     if (await hasProductTitle(page)) return true;
-    if (!clicked) await sleep(250);
   }
   return false;
-}
-
-async function handleContinueShopping(page, context, fallbackUrl, onClick) {
-  try {
-    const clicked = await clickContinueShoppingIfPresent(page);
-    if (!clicked) return page;
-
-    const popupPromise = context.waitForEvent("page", { timeout: 6000 }).catch(() => null);
-    const navPromise = page.waitForNavigation({ timeout: 10000, waitUntil: "commit" }).catch(() => null);
-    const dclPromise = page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => null);
-    await Promise.race([popupPromise, navPromise, dclPromise]);
-
-    const pages = context.pages();
-    const active = pages.find((p) => !p.isClosed() && p.url() !== "about:blank");
-    if (active && active !== page) {
-      try { await active.bringToFront(); } catch {}
-      return active;
-    }
-    if (page && !page.isClosed()) return page;
-
-    const fresh = await context.newPage();
-    try { await fresh.bringToFront(); } catch {}
-    if (fallbackUrl) await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
-    return fresh;
-  } catch {
-    try {
-      const adopted = await adoptActivePageOrThrow(page, context);
-      return adopted;
-    } catch {
-      const fresh = await context.newPage();
-      try { await fresh.bringToFront(); } catch {}
-      if (fallbackUrl) await safeGoto(fresh, fallbackUrl, { retries: 1, timeout: 60000 });
-      return fresh;
-    }
-  }
 }
 
 async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
@@ -353,10 +406,7 @@ async function safeScreenshot(page, opts = { type: "png" }, retries = 1) {
       if (/Target page, context or browser has been closed/i.test(msg)) {
         throw new Error("Screenshot failed: " + msg);
       }
-      if (i < retries) {
-        await sleep(jitter(200, 250));
-        continue;
-      }
+      if (i < retries) continue;
       throw new Error("Screenshot failed: " + msg);
     }
   }
@@ -579,7 +629,7 @@ async function scrapeProductData(page) {
       // SECONDARY: first sub-rank inside ul.zg_hrsr
       const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
       if (sub) {
-        const t = (sub.textContent || "").replace(/\s+/g, " ").trim();  // "#61 in Laundry Detergent Pacs & Tablets"
+        const t = (sub.textContent || "").replace(/\s+/g, " ").trim();
         const r2 = firstHashRank(t) || fallbackRankBeforeIn(t);
         if (r2) res.rankingSecondary = r2;
         const cleanCategoryText = (text = "") => {
@@ -685,10 +735,10 @@ async function scrapeProductData(page) {
   }, title).then((res) => {
     // normalize ranking fields to "Unspecified" where empty
     const p = res.__rankingPayload || {};
-    res.rankingMain      = (p.rankingMain && String(p.rankingMain)) || "Unspecified";
-    res.mainCategory     = (p.mainCategory && String(p.mainCategory).trim()) || "Unspecified";
-    res.rankingSecondary = (p.rankingSecondary && String(p.rankingSecondary)) || "Unspecified";
-    res.secondaryCategory= (p.secondaryCategory && String(p.secondaryCategory).trim()) || "Unspecified";
+    res.rankingMain       = (p.rankingMain && String(p.rankingMain)) || "Unspecified";
+    res.mainCategory      = (p.mainCategory && String(p.mainCategory).trim()) || "Unspecified";
+    res.rankingSecondary  = (p.rankingSecondary && String(p.rankingSecondary)) || "Unspecified";
+    res.secondaryCategory = (p.secondaryCategory && String(p.secondaryCategory).trim()) || "Unspecified";
     delete res.__rankingPayload;
     return res;
   });
@@ -710,7 +760,7 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   const map = {
     "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4",
     "⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
-    "₀":"0","₁":"1","₂":"2","₃":"3","₄":"4",
+    "₀":"0","₁":"1","₂":"2","₃":"3","⁴":"4",
     "₅":"5","₆":"6","₇":"7","₈":"8","₉":"9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
@@ -779,14 +829,21 @@ app.get("/scrape", async (req, res) => {
   let detourBounceAttempts = 0;
   const MAX_DETOUR_BOUNCES = 3;
 
+  // detour counter callback for helpers
+  const onDetour = () => { detourBounceAttempts++; };
+
   try {
     const ctx = await minimalContext(width, height);
     browser = ctx.browser;
     context = ctx.context;
     page = ctx.page;
 
-    // First nav
-    await safeGoto(page, inputUrl, { retries: 2, timeout: 60000 });
+    // First nav (signal-based; detects late mission redirects)
+    await gotoAndDetectDetour(page, inputUrl, {
+      timeout: 60000,
+      dpUrl: intendedDpUrl || undefined,
+      onDetour
+    });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
     // Bounce back to dp if detoured (with homepage-hop for hz/mobile/mission)
@@ -799,15 +856,18 @@ app.get("/scrape", async (req, res) => {
         if (isDpUrl(curUrl)) break;
 
         if (isLikelyDetourUrl(curUrl)) {
-          detourBounceAttempts++;
-
+          onDetour();
           if (/\/hz\/mobile\/mission/i.test(curUrl)) {
             try { await tryGoHomeViaLogo(page); } catch {}
           }
 
-          await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
+          await gotoAndDetectDetour(page, intendedDpUrl, {
+            timeout: 60000,
+            dpUrl: intendedDpUrl,
+            onDetour
+          });
 
-          page = await handleContinueShopping(page, context, intendedDpUrl, null);
+          page = await handleContinueShoppingFast(page, context, intendedDpUrl, onDetour);
 
           if (await hasProductTitle(page)) break;
         } else {
@@ -826,12 +886,16 @@ app.get("/scrape", async (req, res) => {
     let productLike = await isProductPage(page);
     if (!productLike) {
       if (intendedDpUrl && detourBounceAttempts < MAX_DETOUR_BOUNCES) {
-        detourBounceAttempts++;
+        onDetour();
         if (/\/hz\/mobile\/mission/i.test(page.url())) {
           await tryGoHomeViaLogo(page).catch(() => {});
         }
-        await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
-        page = await handleContinueShopping(page, context, intendedDpUrl, null);
+        await gotoAndDetectDetour(page, intendedDpUrl, {
+          timeout: 60000,
+          dpUrl: intendedDpUrl,
+          onDetour
+        });
+        page = await handleContinueShoppingFast(page, context, intendedDpUrl, onDetour);
         productLike = await isProductPage(page);
       }
     }
@@ -864,12 +928,12 @@ app.get("/scrape", async (req, res) => {
       const handled = await clickContinueShoppingIfPresent(page);
       if (!handled) break;
       await Promise.race([
-        page.waitForNavigation({ waitUntil: "commit", timeout: 6000 }).catch(() => null),
-        page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => null),
+        waitForNavSignals(page, { max: 6000 }),
+        context.waitForEvent("page", { timeout: 6000 }).catch(() => null),
       ]);
       const after = page.url();
       if (await hasProductTitle(page)) break;
-      if (after === before) await sleep(220);
+      if (after === before) await page.waitForTimeout(180).catch(() => {});
     }
 
     // Quick settle: if the title is visible, continue immediately
@@ -931,7 +995,7 @@ app.get("/scrape", async (req, res) => {
       rating: scraped.rating || "Unspecified",
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
 
-      // NEW: Ranking fields
+      // Ranking fields
       rankingMain: scraped.rankingMain || "Unspecified",
       mainCategory: scraped.mainCategory || "Unspecified",
       rankingSecondary: scraped.rankingSecondary || "Unspecified",
