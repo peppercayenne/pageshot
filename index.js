@@ -398,17 +398,14 @@ async function scrapeProductData(page) {
   return await page.evaluate((title) => {
     /* Small helpers for rank parsing */
     const firstHashRank = (text = "") => {
-      // Find the first "#<digits, commas, spaces>" and strip non-digits
       const m = (text || "").match(/#\s*([\d][\d,\s.]*)/);
       return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
     };
     const fallbackRankBeforeIn = (text = "") => {
-      // Rare fallback: "<digits> in <category>" without '#'
       const m = (text || "").match(/\b(\d[\d,\s.]*)\s+in\b/i);
       return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
     };
     const cleanCategoryText = (text = "") => {
-      // Take text after "in", stop at "(" and trim
       const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
       return afterIn.split("(")[0].trim();
     };
@@ -512,7 +509,7 @@ async function scrapeProductData(page) {
       });
       if (!li) return "";
 
-      const DATE_RE = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?)\s+\d{1,2},\s+\d{4}\b/;
+      const DATE_RE = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?)\s+\d{1,2},\s+\d{4}\b/;
 
       const bold = li.querySelector("span.a-text-bold");
       if (bold) {
@@ -538,9 +535,9 @@ async function scrapeProductData(page) {
     })();
 
     /* -------- BEST SELLERS RANK (Main + Secondary) -------- */
-    const { rankingMainCategory, mainCategory, rankingSecondary, secondaryCategory } = (() => {
+    const { rankingMain, mainCategory, rankingSecondary, secondaryCategory } = (() => {
       const res = {
-        rankingMainCategory: "",
+        rankingMain: "",
         mainCategory: "",
         rankingSecondary: "",
         secondaryCategory: ""
@@ -563,21 +560,32 @@ async function scrapeProductData(page) {
 
       const mainText = (clone.textContent || "").replace(/\s+/g, " ").trim();
       // Prefer "#<rank>" pattern
+      const firstHashRank = (text = "") => {
+        const m = (text || "").match(/#\s*([\d][\d,\s.]*)/);
+        return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
+      };
+      const fallbackRankBeforeIn = (text = "") => {
+        const m = (text || "").match(/\b(\d[\d,\s.]*)\s+in\b/i);
+        return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
+      };
       let rankMain = firstHashRank(mainText);
       if (!rankMain) rankMain = fallbackRankBeforeIn(mainText);
-      const mainMatch = mainText.match(/#?\s*[\d,.\s]*\s*in\s+(.+?)(?:\s*\(|$)/i);
+      const mainMatch = mainText.match(/#?\s*[\d,.\s]*\s*in\s+(.+?)(?:\s*\|\s*|\s*\(|$)/i);
       const catMain = mainMatch ? mainMatch[1].trim() : "";
 
-      if (rankMain) res.rankingMainCategory = rankMain;
+      if (rankMain) res.rankingMain = rankMain;
       if (catMain)  res.mainCategory = catMain;
 
       // SECONDARY: first sub-rank inside ul.zg_hrsr
       const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
       if (sub) {
         const t = (sub.textContent || "").replace(/\s+/g, " ").trim();  // "#61 in Laundry Detergent Pacs & Tablets"
-        let r2 = firstHashRank(t);
-        if (!r2) r2 = fallbackRankBeforeIn(t);
+        const r2 = firstHashRank(t) || fallbackRankBeforeIn(t);
         if (r2) res.rankingSecondary = r2;
+        const cleanCategoryText = (text = "") => {
+          const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
+          return afterIn.split("(")[0].trim();
+        };
         const cat2 = cleanCategoryText(t);
         if (cat2) res.secondaryCategory = cat2;
       }
@@ -597,7 +605,7 @@ async function scrapeProductData(page) {
         const label = (th.innerText || th.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
         if (/release\s*date|date\s*released|date\s*of\s*release/i.test(label)) {
           const val = (td.innerText || td.textContent || "").replace(/\s+/g, " ").trim();
-          const m = val.match(/\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?)\s+\d{1,2},\s+\d{4}\b/);
+          const m = val.match(/\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?)\s+\d{1,2},\s+\d{4}\b/);
           return (m && m[0]) || val;
         }
       }
@@ -616,14 +624,12 @@ async function scrapeProductData(page) {
     /* -------- Additional Images: ONLY ImageBlockATF (prefer hiRes; per-image fallback to large) -------- */
     const additionalImageUrls = (() => {
       const scripts = Array.from(document.querySelectorAll("script"));
-    
       const unescapeUrl = (u) =>
         (u || "")
           .replace(/\\\//g, "/")
           .replace(/\\u002B/gi, "+")
           .replace(/&amp;/gi, "&")
           .trim();
-    
       const isUseful = (u) => {
         if (!u) return false;
         const lower = u.toLowerCase();
@@ -631,15 +637,10 @@ async function scrapeProductData(page) {
         if (/_US40_|sprite|play-icon|overlay|360_icon|fmjpg|fmpng/i.test(lower)) return false;
         return /\.(jpg|jpeg|png|webp)(\?|$)/i.test(u);
       };
-    
       const urls = new Set();
-    
       for (const s of scripts) {
         const txt = s.textContent || "";
         if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
-    
-        // Iterate per image object and capture its hiRes and large together
-        // For each object: use hiRes if present; otherwise use large.
         const objRe = /{\s*[^{}]*?"hiRes"\s*:\s*(?:["'](https?:[^"']+)["']|null)[\s\S]*?"large"\s*:\s*["'](https?:[^"']+)["'][\s\S]*?}/gi;
         let m;
         while ((m = objRe.exec(txt)) !== null) {
@@ -649,8 +650,6 @@ async function scrapeProductData(page) {
           if (chosen) urls.add(chosen.split("?")[0]);
         }
       }
-    
-      // Don’t echo the normalized main image in the gallery
       return Array.from(urls).filter((u) => u !== normalizedMain);
     })();
 
@@ -670,14 +669,14 @@ async function scrapeProductData(page) {
       dateFirstAvailable: finalDateFirstAvailable,
 
       // New rank fields (strings; "Unspecified" if empty)
-      rankingMainCategory: "",
+      rankingMain: "",
       mainCategory: "",
       rankingSecondary: "",
       secondaryCategory: "",
 
       // temp payload to pass ranking values out
       __rankingPayload: {
-        rankingMainCategory,
+        rankingMain,
         mainCategory,
         rankingSecondary,
         secondaryCategory
@@ -686,10 +685,10 @@ async function scrapeProductData(page) {
   }, title).then((res) => {
     // normalize ranking fields to "Unspecified" where empty
     const p = res.__rankingPayload || {};
-    res.rankingMainCategory = (p.rankingMainCategory && String(p.rankingMainCategory)) || "Unspecified";
-    res.mainCategory       = (p.mainCategory && String(p.mainCategory).trim()) || "Unspecified";
-    res.rankingSecondary   = (p.rankingSecondary && String(p.rankingSecondary)) || "Unspecified";
-    res.secondaryCategory  = (p.secondaryCategory && String(p.secondaryCategory).trim()) || "Unspecified";
+    res.rankingMain      = (p.rankingMain && String(p.rankingMain)) || "Unspecified";
+    res.mainCategory     = (p.mainCategory && String(p.mainCategory).trim()) || "Unspecified";
+    res.rankingSecondary = (p.rankingSecondary && String(p.rankingSecondary)) || "Unspecified";
+    res.secondaryCategory= (p.secondaryCategory && String(p.secondaryCategory).trim()) || "Unspecified";
     delete res.__rankingPayload;
     return res;
   });
@@ -707,12 +706,12 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   let s = (raw || "").trim();
   if (!s) return "Unspecified";
   s = s.replace(/[\u00A0\u2009\u202F]/g, " ");
-  const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]/.test(s);
+  const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆⁷⁸⁹]/.test(s);
   const map = {
-    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
-    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
-    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
-    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+    "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4",
+    "⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
+    "₀":"0","₁":"1","₂":"2","₃":"3","₄":"4",
+    "₅":"5","₆":"6","₇":"7","₈":"8","₉":"9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
   if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
@@ -933,7 +932,7 @@ app.get("/scrape", async (req, res) => {
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
 
       // NEW: Ranking fields
-      rankingMainCategory: scraped.rankingMainCategory || "Unspecified",
+      rankingMain: scraped.rankingMain || "Unspecified",
       mainCategory: scraped.mainCategory || "Unspecified",
       rankingSecondary: scraped.rankingSecondary || "Unspecified",
       secondaryCategory: scraped.secondaryCategory || "Unspecified",
