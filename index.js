@@ -396,6 +396,23 @@ async function scrapeProductData(page) {
     (await page.textContent("#title").catch(() => null));
 
   return await page.evaluate((title) => {
+    /* Small helpers for rank parsing */
+    const firstHashRank = (text = "") => {
+      // Find the first "#<digits, commas, spaces>" and strip non-digits
+      const m = (text || "").match(/#\s*([\d][\d,\s.]*)/);
+      return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
+    };
+    const fallbackRankBeforeIn = (text = "") => {
+      // Rare fallback: "<digits> in <category>" without '#'
+      const m = (text || "").match(/\b(\d[\d,\s.]*)\s+in\b/i);
+      return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
+    };
+    const cleanCategoryText = (text = "") => {
+      // Take text after "in", stop at "(" and trim
+      const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
+      return afterIn.split("(")[0].trim();
+    };
+
     /* -------- Item Form -------- */
     const itemForm = (() => {
       const row =
@@ -538,29 +555,31 @@ async function scrapeProductData(page) {
       });
       if (!li) return res;
 
-      // MAIN: clone the containing span to strip out nested ULs (sub-ranks) before text extraction
+      // MAIN: clone to strip nested UL (sub-ranks) before extracting text
       const holder = li.querySelector("span.a-list-item") || li;
       const clone = holder.cloneNode(true);
       const nested = clone.querySelector("ul.zg_hrsr");
       if (nested) nested.remove();
 
       const mainText = (clone.textContent || "").replace(/\s+/g, " ").trim();
-      // e.g. "#10,820 in Health & Household (See Top 100 in ...)"
-      const m = mainText.match(/#\s*([\d,]+)\s+in\s+(.+?)(?:\s*\(|$)/i);
-      if (m) {
-        res.rankingMainCategory = (m[1] || "").replace(/[^\d]/g, "") || "";
-        res.mainCategory = (m[2] || "").trim() || "";
-      }
+      // Prefer "#<rank>" pattern
+      let rankMain = firstHashRank(mainText);
+      if (!rankMain) rankMain = fallbackRankBeforeIn(mainText);
+      const mainMatch = mainText.match(/#?\s*[\d,.\s]*\s*in\s+(.+?)(?:\s*\(|$)/i);
+      const catMain = mainMatch ? mainMatch[1].trim() : "";
+
+      if (rankMain) res.rankingMainCategory = rankMain;
+      if (catMain)  res.mainCategory = catMain;
 
       // SECONDARY: first sub-rank inside ul.zg_hrsr
       const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
       if (sub) {
         const t = (sub.textContent || "").replace(/\s+/g, " ").trim();  // "#61 in Laundry Detergent Pacs & Tablets"
-        const n = t.match(/#\s*([\d,]+)/);
-        if (n) res.rankingSecondary = (n[1] || "").replace(/[^\d]/g, "");
-        // category: prefer text after "in "
-        const cat = t.replace(/^.*?\bin\b\s*/i, "");
-        res.secondaryCategory = (cat || "").trim();
+        let r2 = firstHashRank(t);
+        if (!r2) r2 = fallbackRankBeforeIn(t);
+        if (r2) res.rankingSecondary = r2;
+        const cat2 = cleanCategoryText(t);
+        if (cat2) res.secondaryCategory = cat2;
       }
 
       return res;
@@ -651,7 +670,7 @@ async function scrapeProductData(page) {
       dateFirstAvailable: finalDateFirstAvailable,
 
       // New rank fields (strings; "Unspecified" if empty)
-      rankingMainCategory: "",  // filled below by wrapper
+      rankingMainCategory: "",
       mainCategory: "",
       rankingSecondary: "",
       secondaryCategory: "",
