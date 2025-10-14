@@ -584,7 +584,7 @@ async function scrapeProductData(page) {
       return (m && m[0]) || "";
     })();
 
-    /* -------- BEST SELLERS RANK (Main + Secondary) -------- */
+    /* -------- BEST SELLERS RANK (Primary + Fallback) -------- */
     const { rankingMain, mainCategory, rankingSecondary, secondaryCategory } = (() => {
       const res = {
         rankingMain: "",
@@ -593,7 +593,21 @@ async function scrapeProductData(page) {
         secondaryCategory: ""
       };
 
-      /* Primary source: detailBullets (existing behavior) */
+      // helpers
+      const firstHashRank = (text = "") => {
+        const m = (text || "").match(/#\s*([\d][\d,\s.]*)/);
+        return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
+      };
+      const fallbackRankBeforeIn = (text = "") => {
+        const m = (text || "").match(/\b(\d[\d,\s.]*)\s+in\b/i);
+        return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
+      };
+      const cleanCategoryText = (text = "") => {
+        const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
+        return afterIn.split("(")[0].trim();
+      };
+
+      // Primary: #detailBullets_feature_div
       const container = document.querySelector("#detailBullets_feature_div");
       if (container) {
         const li = Array.from(container.querySelectorAll("li")).find((node) => {
@@ -626,7 +640,7 @@ async function scrapeProductData(page) {
         }
       }
 
-      /* Fallback source: productDetails table row (requested) */
+      // Fallback: #productDetails_detailBullets_sections1 table
       if (!(res.rankingMain && res.mainCategory)) {
         const table = document.querySelector("#productDetails_detailBullets_sections1");
         if (table) {
@@ -641,23 +655,23 @@ async function scrapeProductData(page) {
           if (bsrRow) {
             const td = bsrRow.querySelector("td");
             if (td) {
-              const items = Array.from(td.querySelectorAll("ul li span.a-list-item, ul li, span.a-list-item"))
+              const lines = Array
+                .from(td.querySelectorAll("ul li span.a-list-item, ul li, span.a-list-item"))
                 .map(n => (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim())
                 .filter(Boolean);
 
-              const parseItem = (txt = "") => {
-                const rank = firstHashRank(txt) || fallbackRankBeforeIn(txt);
-                const cat  = cleanCategoryText(txt);
-                return { rank, cat };
-              };
+              const parseItem = (txt = "") => ({
+                rank: firstHashRank(txt) || fallbackRankBeforeIn(txt),
+                cat:  cleanCategoryText(txt)
+              });
 
-              if (items[0]) {
-                const { rank, cat } = parseItem(items[0]);
+              if (lines[0]) {
+                const { rank, cat } = parseItem(lines[0]);
                 if (!res.rankingMain && rank) res.rankingMain = rank;
                 if (!res.mainCategory && cat) res.mainCategory = cat;
               }
-              if (items[1]) {
-                const { rank, cat } = parseItem(items[1]);
+              if (lines[1]) {
+                const { rank, cat } = parseItem(lines[1]);
                 if (!res.rankingSecondary && rank) res.rankingSecondary = rank;
                 if (!res.secondaryCategory && cat) res.secondaryCategory = cat;
               }
@@ -744,13 +758,12 @@ async function scrapeProductData(page) {
       rating,
       dateFirstAvailable: finalDateFirstAvailable,
 
-      // New rank fields (strings; "Unspecified" if empty)
+      // Ranking (filled via temp payload then normalized outside)
       rankingMain: "",
       mainCategory: "",
       rankingSecondary: "",
       secondaryCategory: "",
 
-      // temp payload to pass ranking values out
       __rankingPayload: {
         rankingMain,
         mainCategory,
@@ -782,12 +795,12 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   let s = (raw || "").trim();
   if (!s) return "Unspecified";
   s = s.replace(/[\u00A0\u2009\u202F]/g, " ");
-  const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅⁶⁷⁸⁹]/.test(s);
+  const hadSuper = /[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆⁷⁸⁹]/.test(s);
   const map = {
     "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4",
     "⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
-    "₀":"0","₁":"1","₂":"2","₃":"3","⁴":"4",
-    "₅":"5","⁶":"6","₇":"7","₈":"8","₉":"9",
+    "₀":"0","₁":"1","₂":"2","³":"3","⁴":"4",
+    "₅":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
   if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
