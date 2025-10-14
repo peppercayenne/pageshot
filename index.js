@@ -135,7 +135,6 @@ function isLikelyDetourUrl(u = "") {
 /* --- Try to jump to the homepage via the header logo, then we can go back -- */
 async function tryGoHomeViaLogo(page) {
   try {
-    // Prefer clicking an anchor inside the logo container if present
     const candidates = [
       '#nav-logo a',
       'a#nav-logo-sprites',
@@ -147,21 +146,17 @@ async function tryGoHomeViaLogo(page) {
       if (await loc.isVisible({ timeout: 800 }).catch(() => false)) {
         const prev = page.url();
         await loc.click({ timeout: 2000 }).catch(() => {});
-        // Wait for a quick signal of homepage state
         await Promise.race([
           page.waitForNavigation({ waitUntil: "commit", timeout: 5000 }).catch(() => null),
           page.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => null),
         ]);
         const now = page.url();
-        // Heuristic: homepage usually contains /ref=nav_logo or root "/"
         if (now !== prev && /amazon\.com\/?(?:\?|$|ref=nav_logo)/i.test(now)) {
           return true;
         }
-        // If it didn't navigate, try a last-ditch: location assign (some headers are inert divs)
         break;
       }
     }
-    // If clicking didn't work, try forcing location change in-page
     const forced = await page.evaluate(() => {
       try {
         location.assign("https://www.amazon.com/ref=nav_logo");
@@ -185,10 +180,8 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let lastErr;
   while (attempt <= retries) {
     try {
-      // trimmed micro-jitter (helps evade flaky race conditions)
       await sleep(jitter(120, 180));
       await page.goto(url, { timeout, waitUntil: "commit" });
-      // trimmed settle delay
       await sleep(jitter(220, 280));
       if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
       return;
@@ -502,13 +495,11 @@ async function scrapeProductData(page) {
       });
       if (!li) return "";
 
-      const DATE_RE = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}\b/;
+      const DATE_RE = /\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?)\s+\d{1,2},\s+\d{4}\b/;
 
-      // 1) Ideal case: bold label span → take its next sibling span’s text
       const bold = li.querySelector("span.a-text-bold");
       if (bold) {
         let sib = bold.nextElementSibling;
-        // skip RTL/LRM spans that are just punctuation
         while (sib && sib.tagName?.toLowerCase() === "span" && !DATE_RE.test(sib.textContent || "")) {
           sib = sib.nextElementSibling;
         }
@@ -517,7 +508,6 @@ async function scrapeProductData(page) {
         if (m) return m[0];
       }
 
-      // 2) Fallback: look at all non-bold spans inside this <li>
       const spans = Array.from(li.querySelectorAll("span")).filter((s) => !s.classList.contains("a-text-bold"));
       for (const s of spans) {
         const t = (s.innerText || s.textContent || "").trim();
@@ -525,10 +515,55 @@ async function scrapeProductData(page) {
         if (m) return m[0];
       }
 
-      // 3) Final fallback: extract from the whole <li> text
       const full = (li.innerText || li.textContent || "").replace(/\s+/g, " ").trim();
       const m = full.match(DATE_RE);
       return (m && m[0]) || "";
+    })();
+
+    /* -------- BEST SELLERS RANK (Main + Secondary) -------- */
+    const { rankingMainCategory, mainCategory, rankingSecondary, secondaryCategory } = (() => {
+      const res = {
+        rankingMainCategory: "",
+        mainCategory: "",
+        rankingSecondary: "",
+        secondaryCategory: ""
+      };
+      const container = document.querySelector("#detailBullets_feature_div");
+      if (!container) return res;
+
+      // Find the <li> that contains "Best Sellers Rank"
+      const li = Array.from(container.querySelectorAll("li")).find((node) => {
+        const label = (node.querySelector("span.a-text-bold")?.innerText || node.innerText || node.textContent || "");
+        return /best\s*sellers?\s*rank/i.test(label);
+      });
+      if (!li) return res;
+
+      // MAIN: clone the containing span to strip out nested ULs (sub-ranks) before text extraction
+      const holder = li.querySelector("span.a-list-item") || li;
+      const clone = holder.cloneNode(true);
+      const nested = clone.querySelector("ul.zg_hrsr");
+      if (nested) nested.remove();
+
+      const mainText = (clone.textContent || "").replace(/\s+/g, " ").trim();
+      // e.g. "#10,820 in Health & Household (See Top 100 in ...)"
+      const m = mainText.match(/#\s*([\d,]+)\s+in\s+(.+?)(?:\s*\(|$)/i);
+      if (m) {
+        res.rankingMainCategory = (m[1] || "").replace(/[^\d]/g, "") || "";
+        res.mainCategory = (m[2] || "").trim() || "";
+      }
+
+      // SECONDARY: first sub-rank inside ul.zg_hrsr
+      const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
+      if (sub) {
+        const t = (sub.textContent || "").replace(/\s+/g, " ").trim();  // "#61 in Laundry Detergent Pacs & Tablets"
+        const n = t.match(/#\s*([\d,]+)/);
+        if (n) res.rankingSecondary = (n[1] || "").replace(/[^\d]/g, "");
+        // category: prefer text after "in "
+        const cat = t.replace(/^.*?\bin\b\s*/i, "");
+        res.secondaryCategory = (cat || "").trim();
+      }
+
+      return res;
     })();
 
     /* -------- Release date fallback (prodDetails table) -------- */
@@ -543,7 +578,7 @@ async function scrapeProductData(page) {
         const label = (th.innerText || th.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
         if (/release\s*date|date\s*released|date\s*of\s*release/i.test(label)) {
           const val = (td.innerText || td.textContent || "").replace(/\s+/g, " ").trim();
-          const m = val.match(/\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4}\b/);
+          const m = val.match(/\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?)\s+\d{1,2},\s+\d{4}\b/);
           return (m && m[0]) || val;
         }
       }
@@ -614,8 +649,31 @@ async function scrapeProductData(page) {
       reviewCount,
       rating,
       dateFirstAvailable: finalDateFirstAvailable,
+
+      // New rank fields (strings; "Unspecified" if empty)
+      rankingMainCategory: "",  // filled below by wrapper
+      mainCategory: "",
+      rankingSecondary: "",
+      secondaryCategory: "",
+
+      // temp payload to pass ranking values out
+      __rankingPayload: {
+        rankingMainCategory,
+        mainCategory,
+        rankingSecondary,
+        secondaryCategory
+      }
     };
-  }, title);
+  }, title).then((res) => {
+    // normalize ranking fields to "Unspecified" where empty
+    const p = res.__rankingPayload || {};
+    res.rankingMainCategory = (p.rankingMainCategory && String(p.rankingMainCategory)) || "Unspecified";
+    res.mainCategory       = (p.mainCategory && String(p.mainCategory).trim()) || "Unspecified";
+    res.rankingSecondary   = (p.rankingSecondary && String(p.rankingSecondary)) || "Unspecified";
+    res.secondaryCategory  = (p.secondaryCategory && String(p.secondaryCategory).trim()) || "Unspecified";
+    delete res.__rankingPayload;
+    return res;
+  });
 }
 
 /* ------------------------------- Gemini OCR ------------------------------- */
@@ -717,7 +775,6 @@ app.get("/scrape", async (req, res) => {
     const bounceBackToDp = async () => {
       if (!intendedDpUrl) return;
       for (let i = 0; i < MAX_DETOUR_BOUNCES; i++) {
-        // Prefer fast product-title signal over fixed settle sleeps
         if (await hasProductTitle(page) && isDpUrl(page.url())) break;
 
         const curUrl = page.url();
@@ -726,20 +783,14 @@ app.get("/scrape", async (req, res) => {
         if (isLikelyDetourUrl(curUrl)) {
           detourBounceAttempts++;
 
-          // Special case: if it's the mobile mission page, hop to homepage via logo first
           if (/\/hz\/mobile\/mission/i.test(curUrl)) {
-            try {
-              await tryGoHomeViaLogo(page);
-              // no need to wait long; we will immediately navigate to the dp
-            } catch {}
+            try { await tryGoHomeViaLogo(page); } catch {}
           }
 
           await safeGoto(page, intendedDpUrl, { retries: 1, timeout: 60000 });
 
-          // handle potential continue-shopping overlays
           page = await handleContinueShopping(page, context, intendedDpUrl, null);
 
-          // If we now see a title, we’re good
           if (await hasProductTitle(page)) break;
         } else {
           break;
@@ -758,7 +809,6 @@ app.get("/scrape", async (req, res) => {
     if (!productLike) {
       if (intendedDpUrl && detourBounceAttempts < MAX_DETOUR_BOUNCES) {
         detourBounceAttempts++;
-        // If we somehow landed on mission again, try home hop again
         if (/\/hz\/mobile\/mission/i.test(page.url())) {
           await tryGoHomeViaLogo(page).catch(() => {});
         }
@@ -862,6 +912,13 @@ app.get("/scrape", async (req, res) => {
       reviewCount: scraped.reviewCount || "Unspecified",
       rating: scraped.rating || "Unspecified",
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
+
+      // NEW: Ranking fields
+      rankingMainCategory: scraped.rankingMainCategory || "Unspecified",
+      mainCategory: scraped.mainCategory || "Unspecified",
+      rankingSecondary: scraped.rankingSecondary || "Unspecified",
+      secondaryCategory: scraped.secondaryCategory || "Unspecified",
+
       screenshot: base64,
       detourBounceAttempts,
     });
