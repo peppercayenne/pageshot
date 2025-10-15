@@ -120,17 +120,6 @@ async function looksBlocked(page) {
   } catch {}
   return false;
 }
-function isLikelyDetourUrl(u = "") {
-  return (
-    /\/hz\/mobile\/mission/i.test(u) ||
-    /\/ap\/signin/i.test(u) ||
-    /\/gp\/help/i.test(u) ||
-    /\/gp\/navigation/i.test(u) ||
-    /\/customer-preferences/i.test(u) ||
-    /\/gp\/yourstore/i.test(u) ||
-    /\/gp\/history/i.test(u)
-  );
-}
 
 /* --- Try to jump to the homepage via the header logo, then we can go back -- */
 async function tryGoHomeViaLogo(page) {
@@ -217,6 +206,46 @@ async function waitForNavSignals(page, {
   await Promise.race(waiters);
 }
 
+/* -------------------- Mission-page detection & recovery -------------------- */
+async function isOnMissionPage(page) {
+  try {
+    return await page.evaluate(() => !!document.querySelector("#mission-page-first-page-element"));
+  } catch {
+    return false;
+  }
+}
+
+async function hopHomeAndBack(page, targetUrl) {
+  // 1) Try clicking the logo
+  let hopped = false;
+  try {
+    const logo = page.locator("#nav-logo-sprites").first();
+    if (await logo.isVisible({ timeout: 800 }).catch(() => false)) {
+      await logo.click({ timeout: 1500 }).catch(() => {});
+      await waitForNavSignals(page, { max: 6000 });
+      hopped = /amazon\.com\/?(?:\?|$|ref=nav_logo)/i.test(page.url());
+    }
+  } catch {}
+
+  // 2) If not, force home
+  if (!hopped) {
+    try {
+      await page.goto("https://www.amazon.com/ref=nav_logo", { waitUntil: "commit", timeout: 60000 });
+      await waitForNavSignals(page, { max: 6000 });
+      hopped = true;
+    } catch {}
+  }
+
+  // 3) Jump back to target URL
+  if (hopped && targetUrl) {
+    try {
+      await page.goto(targetUrl, { waitUntil: "commit", timeout: 60000 });
+      await waitForNavSignals(page, { max: 6000 });
+    } catch {}
+  }
+  return hopped;
+}
+
 async function gotoAndDetectDetour(page, url, {
   timeout = 60000,
   dpUrl,
@@ -224,15 +253,14 @@ async function gotoAndDetectDetour(page, url, {
 } = {}) {
   await page.goto(url, { timeout, waitUntil: "commit" });
   await waitForNavSignals(page, { max: 6000 });
-  const final = await settledUrl(page);
-  if (/\/hz\/mobile\/mission/i.test(final)) {
+
+  // Detect mission-page by element presence (not URL)
+  if (await isOnMissionPage(page)) {
     onDetour?.();
-    try { await tryGoHomeViaLogo(page); } catch {}
-    if (dpUrl) {
-      await page.goto(dpUrl, { timeout, waitUntil: "commit" });
-      await waitForNavSignals(page, { max: 6000 });
-    }
+    await hopHomeAndBack(page, dpUrl || url);
   }
+
+  const final = await settledUrl(page);
   if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
   return page;
 }
@@ -246,14 +274,10 @@ async function handleContinueShoppingFast(page, context, dpUrl, onDetour) {
     context.waitForEvent("page", { timeout: 6000 }).catch(() => null),
   ]);
 
-  const u = page.url();
-  if (/\/hz\/mobile\/mission/i.test(u)) {
+  // In case the click drops us on a mission page
+  if (await isOnMissionPage(page)) {
     onDetour?.();
-    try { await tryGoHomeViaLogo(page); } catch {}
-    if (dpUrl) {
-      await page.goto(dpUrl, { waitUntil: "commit" });
-      await waitForNavSignals(page, { max: 6000 });
-    }
+    await hopHomeAndBack(page, dpUrl);
   }
 
   const hasTitle = await page.locator("#productTitle, #title").first().isVisible({ timeout: 400 }).catch(() => false);
@@ -264,7 +288,6 @@ async function handleContinueShoppingFast(page, context, dpUrl, onDetour) {
 }
 
 /* ---------------------------- Navigation helpers -------------------------- */
-// Kept for compatibility in a few places; now uses signal waits instead of blind sleeps
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let attempt = 0;
   let lastErr;
@@ -272,6 +295,10 @@ async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
     try {
       await page.goto(url, { timeout, waitUntil: "commit" });
       await waitForNavSignals(page, { max: 6000 });
+      // If we landed on a mission page, use home hop + back
+      if (await isOnMissionPage(page)) {
+        await hopHomeAndBack(page, url);
+      }
       await settledUrl(page);
       if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
       return;
@@ -439,141 +466,6 @@ async function isProductPage(page) {
   }
 }
 
-/* ----------------------- Continue Shopping Interstitial -------------------- */
-// Detection: dp URL but full-page “Continue/Keep shopping” interface (no header/title)
-async function isContinueInterstitial(page) {
-  try {
-    const urlLooksDp = /\/dp\/[A-Z0-9]{8,10}/i.test(page.url());
-    if (!urlLooksDp) return false;
-
-    const hasTitle = await page.$('#productTitle, #title');
-    const hasHeader = await page.$('#nav-main, #nav-belt, #navbar');
-    if (hasTitle || hasHeader) return false;
-
-    const selectors = [
-      '#hlb-continue-shopping-announce',
-      '#attach-close_sideSheet-link',
-      '#attachDisplayAddBaseAlert',
-      '#NATC_SMART_WAGON_CONF_MSG_SUCCESS',
-      '#huc-v2-order-row-confirm-text',
-      'form[action*="continueShopping"]',
-      'a[href*="continueShopping"]',
-      'button[name*="continueShopping"]',
-      'button:has-text("Continue shopping")',
-      'a:has-text("Continue shopping")',
-      'button:has-text("Keep shopping")',
-      'a:has-text("Keep shopping")',
-    ];
-    for (const sel of selectors) {
-      if (await page.$(sel)) return true;
-    }
-
-    const maybeInterstitial = await page.evaluate(() => {
-      const txt = (document.body?.innerText || '').toLowerCase();
-      return /continue shopping|keep shopping|added to cart|added to your cart/.test(txt);
-    });
-    return !!maybeInterstitial;
-  } catch {
-    return false;
-  }
-}
-
-const CONT_SHOP_MAX_PASSES = 3;
-
-async function resolveContinueInterstitial(page, context, dpUrl, counters = {}) {
-  counters.continueShoppingPasses = counters.continueShoppingPasses || 0;
-
-  async function closeSideSheet() {
-    try {
-      const el = await page.$('#attach-close_sideSheet-link');
-      if (el) {
-        await el.click({ timeout: 1500 }).catch(() => {});
-        await Promise.race([
-          page.waitForLoadState('domcontentloaded', { timeout: 3000 }).catch(() => {}),
-          page.waitForURL(/\/dp\//i, { timeout: 3000 }).catch(() => {}),
-        ]);
-        return true;
-      }
-    } catch {}
-    return false;
-  }
-
-  async function clickAnyContinue() {
-    const tries = [
-      '#hlb-continue-shopping-announce',
-      'a#hlb-continue-shopping-announce',
-      'form[action*="continueShopping"] input[type=submit]',
-      'form[action*="continueShopping"] button',
-      'a[href*="continueShopping"]',
-      'button[name*="continueShopping"]',
-      'input[type="submit"][value*="Continue shopping" i]',
-      'input[type="submit"][value*="Keep shopping" i]',
-      'button:has-text("Continue shopping")',
-      'a:has-text("Continue shopping")',
-      'button:has-text("Keep shopping")',
-      'a:has-text("Keep shopping")',
-    ];
-    for (const sel of tries) {
-      try {
-        const loc = page.locator(sel).first();
-        if (await loc.isVisible({ timeout: 400 }).catch(() => false)) {
-          await loc.click({ timeout: 1500 }).catch(() => {});
-          return true;
-        }
-      } catch {}
-    }
-    try {
-      const clicked = await page.evaluate(() => {
-        const nodes = Array.from(document.querySelectorAll('button, a, input[type="submit"], div[role="button"]'));
-        const target = nodes.find((n) => {
-          const t = ((n.innerText || n.value || '') + '').toLowerCase();
-          return t.includes('continue shopping') || t.includes('keep shopping');
-        });
-        if (target) { target.click(); return true; }
-        return false;
-      });
-      if (clicked) return true;
-    } catch {}
-    return false;
-  }
-
-  for (let pass = 0; pass < CONT_SHOP_MAX_PASSES; pass++) {
-    if (!(await isContinueInterstitial(page))) break;
-    counters.continueShoppingPasses++;
-
-    if (await closeSideSheet()) {
-      await Promise.race([
-        page.waitForSelector('#productTitle, #title', { timeout: 3000 }).catch(() => null),
-        page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => null),
-      ]);
-      if (!(await isContinueInterstitial(page))) break;
-    }
-
-    const didClick = await clickAnyContinue();
-    await Promise.race([
-      page.waitForLoadState('domcontentloaded', { timeout: 4000 }).catch(() => null),
-      page.waitForNavigation({ waitUntil: 'commit', timeout: 4000 }).catch(() => null),
-      page.waitForSelector('#productTitle, #title', { timeout: 1200 }).catch(() => null),
-    ]);
-
-    if (await isContinueInterstitial(page)) {
-      await page.keyboard.press('Escape').catch(() => {});
-      await page.waitForTimeout(200).catch(() => {});
-      if (await isContinueInterstitial(page) && dpUrl) {
-        await page.goto(dpUrl, { waitUntil: 'commit' });
-        await Promise.race([
-          page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => null),
-          page.waitForSelector('#productTitle, #title', { timeout: 1500 }).catch(() => null),
-        ]);
-      }
-    }
-
-    const hasTitle = await page.locator('#productTitle, #title').first()
-      .isVisible({ timeout: 500 }).catch(() => false);
-    if (hasTitle) break;
-  }
-}
-
 /* ------------------------------ Product scrape ---------------------------- */
 async function scrapeProductData(page) {
   const title =
@@ -719,7 +611,7 @@ async function scrapeProductData(page) {
       return (m && m[0]) || "";
     })();
 
-    /* -------- BEST SELLERS RANK (Main + Secondary) -------- */
+    /* -------- BEST SELLERS RANK (Primary + Fallback) -------- */
     const { rankingMain, mainCategory, rankingSecondary, secondaryCategory } = (() => {
       const res = {
         rankingMain: "",
@@ -727,24 +619,8 @@ async function scrapeProductData(page) {
         rankingSecondary: "",
         secondaryCategory: ""
       };
-      const container = document.querySelector("#detailBullets_feature_div");
-      if (!container) return res;
 
-      // Find the <li> that contains "Best Sellers Rank"
-      const li = Array.from(container.querySelectorAll("li")).find((node) => {
-        const label = (node.querySelector("span.a-text-bold")?.innerText || node.innerText || node.textContent || "");
-        return /best\s*sellers?\s*rank/i.test(label);
-      });
-      if (!li) return res;
-
-      // MAIN: clone to strip nested UL (sub-ranks) before extracting text
-      const holder = li.querySelector("span.a-list-item") || li;
-      const clone = holder.cloneNode(true);
-      const nested = clone.querySelector("ul.zg_hrsr");
-      if (nested) nested.remove();
-
-      const mainText = (clone.textContent || "").replace(/\s+/g, " ").trim();
-      // Prefer "#<rank>" pattern
+      /* helpers */
       const firstHashRank = (text = "") => {
         const m = (text || "").match(/#\s*([\d][\d,\s.]*)/);
         return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
@@ -753,26 +629,84 @@ async function scrapeProductData(page) {
         const m = (text || "").match(/\b(\d[\d,\s.]*)\s+in\b/i);
         return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
       };
-      let rankMain = firstHashRank(mainText);
-      if (!rankMain) rankMain = fallbackRankBeforeIn(mainText);
-      const mainMatch = mainText.match(/#?\s*[\d,.\s]*\s*in\s+(.+?)(?:\s*\|\s*|\s*\(|$)/i);
-      const catMain = mainMatch ? mainMatch[1].trim() : "";
+      const cleanCategoryText = (text = "") => {
+        const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
+        return afterIn.split("(")[0].trim();
+      };
 
-      if (rankMain) res.rankingMain = rankMain;
-      if (catMain)  res.mainCategory = catMain;
+      /* ---------- Primary source: #detailBullets_feature_div ---------- */
+      const container = document.querySelector("#detailBullets_feature_div");
+      if (container) {
+        const li = Array.from(container.querySelectorAll("li")).find((node) => {
+          const label = (node.querySelector("span.a-text-bold")?.innerText || node.innerText || node.textContent || "");
+          return /best\s*sellers?\s*rank/i.test(label);
+        });
 
-      // SECONDARY: first sub-rank inside ul.zg_hrsr
-      const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
-      if (sub) {
-        const t = (sub.textContent || "").replace(/\s+/g, " ").trim();
-        const r2 = firstHashRank(t) || fallbackRankBeforeIn(t);
-        if (r2) res.rankingSecondary = r2;
-        const cleanCategoryText = (text = "") => {
-          const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
-          return afterIn.split("(")[0].trim();
-        };
-        const cat2 = cleanCategoryText(t);
-        if (cat2) res.secondaryCategory = cat2;
+        if (li) {
+          const holder = li.querySelector("span.a-list-item") || li;
+          const clone = holder.cloneNode(true);
+          const nested = clone.querySelector("ul.zg_hrsr");
+          if (nested) nested.remove();
+
+          const mainText = (clone.textContent || "").replace(/\s+/g, " ").trim();
+          let rankMain = firstHashRank(mainText) || fallbackRankBeforeIn(mainText);
+          const mainMatch = mainText.match(/#?\s*[\d,.\s]*\s*in\s+(.+?)(?:\s*\|\s*|\s*\(|$)/i);
+          const catMain = mainMatch ? mainMatch[1].trim() : "";
+
+          if (rankMain) res.rankingMain = rankMain;
+          if (catMain)  res.mainCategory = catMain;
+
+          const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
+          if (sub) {
+            const t = (sub.textContent || "").replace(/\s+/g, " ").trim();
+            const r2 = firstHashRank(t) || fallbackRankBeforeIn(t);
+            if (r2) res.rankingSecondary = r2;
+            const cat2 = cleanCategoryText(t);
+            if (cat2) res.secondaryCategory = cat2;
+          }
+        }
+      }
+
+      /* ------ Fallback: broader product details table(s) ------ */
+      if (!(res.rankingMain && res.mainCategory)) {
+        const table = document.querySelector(
+          "#productDetails_detailBullets_sections1, #productDetails_techSpec_section_1, table.a-keyvalue.prodDetTable"
+        );
+        if (table) {
+          const rows = Array.from(table.querySelectorAll("tr"));
+          const bsrRow = rows.find(tr => {
+            const th = tr.querySelector("th");
+            if (!th) return false;
+            const t = (th.innerText || th.textContent || "").trim().toLowerCase();
+            return t.includes("best sellers rank");
+          });
+
+          if (bsrRow) {
+            const td = bsrRow.querySelector("td");
+            if (td) {
+              const lines = Array
+                .from(td.querySelectorAll("ul li span.a-list-item, ul li, span.a-list-item"))
+                .map(n => (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim())
+                .filter(Boolean);
+
+              const parseItem = (txt = "") => ({
+                rank: firstHashRank(txt) || fallbackRankBeforeIn(txt),
+                cat:  cleanCategoryText(txt)
+              });
+
+              if (lines[0]) {
+                const { rank, cat } = parseItem(lines[0]);
+                if (!res.rankingMain && rank) res.rankingMain = rank;
+                if (!res.mainCategory && cat) res.mainCategory = cat;
+              }
+              if (lines[1]) {
+                const { rank, cat } = parseItem(lines[1]);
+                if (!res.rankingSecondary && rank) res.rankingSecondary = rank;
+                if (!res.secondaryCategory && cat) res.secondaryCategory = cat;
+              }
+            }
+          }
+        }
       }
 
       return res;
@@ -806,7 +740,7 @@ async function scrapeProductData(page) {
     const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
-    /* -------- Additional Images: ONLY ImageBlockATF (prefer hiRes; per-image fallback to large) -------- */
+    /* -------- Additional Images: ONLY ImageBlockATF -------- */
     const additionalImageUrls = (() => {
       const scripts = Array.from(document.querySelectorAll("script"));
       const unescapeUrl = (u) =>
@@ -853,7 +787,7 @@ async function scrapeProductData(page) {
       rating,
       dateFirstAvailable: finalDateFirstAvailable,
 
-      // New rank fields (strings; "Unspecified" if empty)
+      // Rank fields (strings; "Unspecified" if empty)
       rankingMain: "",
       mainCategory: "",
       rankingSecondary: "",
@@ -896,7 +830,7 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
     "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4",
     "⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
     "₀":"0","₁":"1","₂":"2","₃":"3","⁴":"4",
-    "₅":"5","₆":"6","₇":"7","₈":"8","₉":"9",
+    "₅":"5","₆":"6","₇":"7","⁸":"8","₉":"9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
   if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
@@ -967,16 +901,13 @@ app.get("/scrape", async (req, res) => {
   // detour counter callback for helpers
   const onDetour = () => { detourBounceAttempts++; };
 
-  // counters for continue shopping interstitial attempts
-  const counters = { continueShoppingPasses: 0 };
-
   try {
     const ctx = await minimalContext(width, height);
     browser = ctx.browser;
     context = ctx.context;
     page = ctx.page;
 
-    // First nav (signal-based; detects late mission redirects)
+    // First nav (signal-based; detects mission-page via element)
     await gotoAndDetectDetour(page, inputUrl, {
       timeout: 60000,
       dpUrl: intendedDpUrl || undefined,
@@ -984,34 +915,29 @@ app.get("/scrape", async (req, res) => {
     });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Try resolving “Continue Shopping” interstitial immediately if present
-    await resolveContinueInterstitial(page, context, intendedDpUrl, counters);
-
-    // Bounce back to dp if detoured (with homepage-hop for hz/mobile/mission)
+    // Bounce back to dp if detoured (homepage hop if needed)
     const bounceBackToDp = async () => {
       if (!intendedDpUrl) return;
       for (let i = 0; i < MAX_DETOUR_BOUNCES; i++) {
         if (await hasProductTitle(page) && isDpUrl(page.url())) break;
 
         const curUrl = page.url();
-        if (isDpUrl(curUrl)) break;
+        if (isDpUrl(curUrl) && await hasProductTitle(page)) break;
 
-        if (isLikelyDetourUrl(curUrl)) {
+        // If mission-page DOM shows up at any time, hop home then back
+        if (await isOnMissionPage(page)) {
           onDetour();
-          if (/\/hz\/mobile\/mission/i.test(curUrl)) {
-            try { await tryGoHomeViaLogo(page); } catch {}
-          }
-
+          await hopHomeAndBack(page, intendedDpUrl);
+          if (await hasProductTitle(page)) break;
+        } else {
+          // Best-effort push back to intended DP
           await gotoAndDetectDetour(page, intendedDpUrl, {
             timeout: 60000,
             dpUrl: intendedDpUrl,
             onDetour
           });
-
           page = await handleContinueShoppingFast(page, context, intendedDpUrl, onDetour);
-
           if (await hasProductTitle(page)) break;
-        } else {
           break;
         }
       }
@@ -1023,27 +949,21 @@ app.get("/scrape", async (req, res) => {
       await trySimpleContinueShoppingFallback(page, 3, null);
     }
 
-    // One more interstitial resolution pass after the above steps
-    await resolveContinueInterstitial(page, context, intendedDpUrl, counters);
-
     // Final product check; if not product after bounces, return nonProduct JSON
     let productLike = await isProductPage(page);
     if (!productLike) {
       if (intendedDpUrl && detourBounceAttempts < MAX_DETOUR_BOUNCES) {
         onDetour();
-        if (/\/hz\/mobile\/mission/i.test(page.url())) {
-          await tryGoHomeViaLogo(page).catch(() => {});
+        if (await isOnMissionPage(page)) {
+          await hopHomeAndBack(page, intendedDpUrl);
+        } else {
+          await gotoAndDetectDetour(page, intendedDpUrl, {
+            timeout: 60000,
+            dpUrl: intendedDpUrl,
+            onDetour
+          });
         }
-        await gotoAndDetectDetour(page, intendedDpUrl, {
-          timeout: 60000,
-          dpUrl: intendedDpUrl,
-          onDetour
-        });
         page = await handleContinueShoppingFast(page, context, intendedDpUrl, onDetour);
-
-        // resolve interstitial again if it reappeared
-        await resolveContinueInterstitial(page, context, intendedDpUrl, counters);
-
         productLike = await isProductPage(page);
       }
     }
@@ -1066,7 +986,6 @@ app.get("/scrape", async (req, res) => {
         url: page.url() || returnUrl,
         pageType: "nonProduct",
         detourBounceAttempts,
-        continueShoppingPasses: counters.continueShoppingPasses,
         screenshot: base64NP,
       });
     }
@@ -1080,13 +999,14 @@ app.get("/scrape", async (req, res) => {
         waitForNavSignals(page, { max: 6000 }),
         context.waitForEvent("page", { timeout: 6000 }).catch(() => null),
       ]);
+      if (await isOnMissionPage(page)) {
+        onDetour();
+        await hopHomeAndBack(page, intendedDpUrl);
+      }
       const after = page.url();
       if (await hasProductTitle(page)) break;
       if (after === before) await page.waitForTimeout(180).catch(() => {});
     }
-
-    // Final interstitial resolution pass before scraping (covers full-page overlay on /dp)
-    await resolveContinueInterstitial(page, context, intendedDpUrl, counters);
 
     // Quick settle: if the title is visible, continue immediately
     await page.locator("#productTitle, #title").first().isVisible({ timeout: 500 }).catch(() => {});
@@ -1155,7 +1075,6 @@ app.get("/scrape", async (req, res) => {
 
       screenshot: base64,
       detourBounceAttempts,
-      continueShoppingPasses: counters.continueShoppingPasses,
     });
   } catch (err) {
     res.status(500).json({ ok: false, error: err?.message || String(err) });
