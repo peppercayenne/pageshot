@@ -120,59 +120,6 @@ async function looksBlocked(page) {
   } catch {}
   return false;
 }
-function isLikelyDetourUrl(u = "") {
-  return (
-    /\/hz\/mobile\/mission/i.test(u) ||
-    /\/ap\/signin/i.test(u) ||
-    /\/gp\/help/i.test(u) ||
-    /\/gp\/navigation/i.test(u) ||
-    /\/customer-preferences/i.test(u) ||
-    /\/gp\/yourstore/i.test(u) ||
-    /\/gp\/history/i.test(u)
-  );
-}
-
-/* --- Try to jump to the homepage via the header logo, then we can go back -- */
-async function tryGoHomeViaLogo(page) {
-  try {
-    const candidates = [
-      '#nav-logo a',
-      'a#nav-logo-sprites',
-      '#nav-logo',
-      '#nav-logo-sprites'
-    ];
-    for (const sel of candidates) {
-      const loc = page.locator(sel).first();
-      if (await loc.isVisible({ timeout: 800 }).catch(() => false)) {
-        const prev = page.url();
-        await loc.click({ timeout: 2000 }).catch(() => {});
-        await Promise.race([
-          page.waitForNavigation({ waitUntil: "commit", timeout: 5000 }).catch(() => null),
-          page.waitForLoadState("domcontentloaded", { timeout: 5000 }).catch(() => null),
-        ]);
-        const now = page.url();
-        if (now !== prev && /amazon\.com\/?(?:\?|$|ref=nav_logo)/i.test(now)) {
-          return true;
-        }
-        break;
-      }
-    }
-    const forced = await page.evaluate(() => {
-      try {
-        location.assign("https://www.amazon.com/ref=nav_logo");
-        return true;
-      } catch { return false; }
-    });
-    if (forced) {
-      await Promise.race([
-        page.waitForNavigation({ waitUntil: "commit", timeout: 6000 }).catch(() => null),
-        page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => null),
-      ]);
-      return true;
-    }
-  } catch {}
-  return false;
-}
 
 /* ------------------------- Signal-based wait helpers ----------------------- */
 async function settledUrl(page, {
@@ -200,7 +147,6 @@ async function waitForNavSignals(page, {
   const waiters = [
     page.waitForLoadState("domcontentloaded", { timeout: max }).catch(() => null),
     page.waitForSelector(titleSel, { timeout: Math.min(1500, max) }).catch(() => null),
-    page.waitForURL(/\/hz\/mobile\/mission/i, { timeout: max }).catch(() => null),
   ];
   if (urlChange) {
     waiters.push(
@@ -217,21 +163,55 @@ async function waitForNavSignals(page, {
   await Promise.race(waiters);
 }
 
-async function gotoAndDetectDetour(page, url, {
+// NEW: detect Amazon "mission" interstitial by DOM, not by URL
+async function isMissionInterstitial(page) {
+  try {
+    return await page.evaluate(() => !!document.getElementById("mission-page-first-page-element"));
+  } catch {
+    return false;
+  }
+}
+
+// NEW: go to homepage via logo if possible; else direct; then back to target
+async function goHomeThenBack(page, targetUrl, { timeout = 60000 } = {}) {
+  // 1) Try clicking the header logo
+  try {
+    const logo = page.locator('a#nav-logo-sprites').first();
+    if (await logo.isVisible({ timeout: 800 }).catch(() => false)) {
+      await logo.click({ timeout: 2000 }).catch(() => {});
+      await Promise.race([
+        page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => null),
+        page.waitForNavigation({ waitUntil: "commit", timeout: 6000 }).catch(() => null),
+      ]);
+    }
+  } catch {}
+  // 2) If still stuck (or logo not clickable), hard navigate to homepage
+  try {
+    await page.goto("https://www.amazon.com/ref=nav_logo", { waitUntil: "commit", timeout });
+    await waitForNavSignals(page, { max: 6000 });
+    await settledUrl(page);
+  } catch {}
+  // 3) Jump right back to the target URL (prefer /dp/[ASIN])
+  if (targetUrl) {
+    await page.goto(targetUrl, { waitUntil: "commit", timeout });
+    await waitForNavSignals(page, { max: 6000 });
+    await settledUrl(page);
+  }
+}
+
+// Updated: navigation that auto-recovers from mission interstitial if detected by DOM
+async function gotoAndRecoverMission(page, url, {
   timeout = 60000,
-  dpUrl,
+  targetUrlAfterHome, // typically the intended /dp/[ASIN] or original input
   onDetour,          // () => void
 } = {}) {
   await page.goto(url, { timeout, waitUntil: "commit" });
   await waitForNavSignals(page, { max: 6000 });
-  const final = await settledUrl(page);
-  if (/\/hz\/mobile\/mission/i.test(final)) {
+  await settledUrl(page);
+
+  if (await isMissionInterstitial(page)) {
     onDetour?.();
-    try { await tryGoHomeViaLogo(page); } catch {}
-    if (dpUrl) {
-      await page.goto(dpUrl, { timeout, waitUntil: "commit" });
-      await waitForNavSignals(page, { max: 6000 });
-    }
+    await goHomeThenBack(page, targetUrlAfterHome || url, { timeout });
   }
   if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
   return page;
@@ -246,14 +226,10 @@ async function handleContinueShoppingFast(page, context, dpUrl, onDetour) {
     context.waitForEvent("page", { timeout: 6000 }).catch(() => null),
   ]);
 
-  const u = page.url();
-  if (/\/hz\/mobile\/mission/i.test(u)) {
+  // If a mission interstitial appears during this flow, recover and go back to dpUrl
+  if (await isMissionInterstitial(page)) {
     onDetour?.();
-    try { await tryGoHomeViaLogo(page); } catch {}
-    if (dpUrl) {
-      await page.goto(dpUrl, { waitUntil: "commit" });
-      await waitForNavSignals(page, { max: 6000 });
-    }
+    await goHomeThenBack(page, dpUrl);
   }
 
   const hasTitle = await page.locator("#productTitle, #title").first().isVisible({ timeout: 400 }).catch(() => false);
@@ -264,7 +240,6 @@ async function handleContinueShoppingFast(page, context, dpUrl, onDetour) {
 }
 
 /* ---------------------------- Navigation helpers -------------------------- */
-// Kept for compatibility in a few places; now uses signal waits instead of blind sleeps
 async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
   let attempt = 0;
   let lastErr;
@@ -584,7 +559,7 @@ async function scrapeProductData(page) {
       return (m && m[0]) || "";
     })();
 
-    /* -------- BEST SELLERS RANK (Main + Secondary) -------- */
+    /* -------- BEST SELLERS RANK (Primary + Fallback) -------- */
     const { rankingMain, mainCategory, rankingSecondary, secondaryCategory } = (() => {
       const res = {
         rankingMain: "",
@@ -592,24 +567,8 @@ async function scrapeProductData(page) {
         rankingSecondary: "",
         secondaryCategory: ""
       };
-      const container = document.querySelector("#detailBullets_feature_div");
-      if (!container) return res;
 
-      // Find the <li> that contains "Best Sellers Rank"
-      const li = Array.from(container.querySelectorAll("li")).find((node) => {
-        const label = (node.querySelector("span.a-text-bold")?.innerText || node.innerText || node.textContent || "");
-        return /best\s*sellers?\s*rank/i.test(label);
-      });
-      if (!li) return res;
-
-      // MAIN: clone to strip nested UL (sub-ranks) before extracting text
-      const holder = li.querySelector("span.a-list-item") || li;
-      const clone = holder.cloneNode(true);
-      const nested = clone.querySelector("ul.zg_hrsr");
-      if (nested) nested.remove();
-
-      const mainText = (clone.textContent || "").replace(/\s+/g, " ").trim();
-      // Prefer "#<rank>" pattern
+      /* helpers */
       const firstHashRank = (text = "") => {
         const m = (text || "").match(/#\s*([\d][\d,\s.]*)/);
         return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
@@ -618,26 +577,82 @@ async function scrapeProductData(page) {
         const m = (text || "").match(/\b(\d[\d,\s.]*)\s+in\b/i);
         return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
       };
-      let rankMain = firstHashRank(mainText);
-      if (!rankMain) rankMain = fallbackRankBeforeIn(mainText);
-      const mainMatch = mainText.match(/#?\s*[\d,.\s]*\s*in\s+(.+?)(?:\s*\|\s*|\s*\(|$)/i);
-      const catMain = mainMatch ? mainMatch[1].trim() : "";
+      const cleanCategoryText = (text = "") => {
+        const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
+        return afterIn.split("(")[0].trim();
+      };
 
-      if (rankMain) res.rankingMain = rankMain;
-      if (catMain)  res.mainCategory = catMain;
+      /* ---------- Primary source: #detailBullets_feature_div ---------- */
+      const container = document.querySelector("#detailBullets_feature_div");
+      if (container) {
+        const li = Array.from(container.querySelectorAll("li")).find((node) => {
+          const label = (node.querySelector("span.a-text-bold")?.innerText || node.innerText || node.textContent || "");
+          return /best\s*sellers?\s*rank/i.test(label);
+        });
 
-      // SECONDARY: first sub-rank inside ul.zg_hrsr
-      const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
-      if (sub) {
-        const t = (sub.textContent || "").replace(/\s+/g, " ").trim();
-        const r2 = firstHashRank(t) || fallbackRankBeforeIn(t);
-        if (r2) res.rankingSecondary = r2;
-        const cleanCategoryText = (text = "") => {
-          const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
-          return afterIn.split("(")[0].trim();
-        };
-        const cat2 = cleanCategoryText(t);
-        if (cat2) res.secondaryCategory = cat2;
+        if (li) {
+          const holder = li.querySelector("span.a-list-item") || li;
+          const clone = holder.cloneNode(true);
+          const nested = clone.querySelector("ul.zg_hrsr");
+          if (nested) nested.remove();
+
+          const mainText = (clone.textContent || "").replace(/\s+/g, " ").trim();
+          let rankMain = firstHashRank(mainText) || fallbackRankBeforeIn(mainText);
+          const mainMatch = mainText.match(/#?\s*[\d,.\s]*\s*in\s+(.+?)(?:\s*\|\s*|\s*\(|$)/i);
+          const catMain = mainMatch ? mainMatch[1].trim() : "";
+
+          if (rankMain) res.rankingMain = rankMain;
+          if (catMain)  res.mainCategory = catMain;
+
+          const sub = li.querySelector("ul.zg_hrsr li span.a-list-item") || li.querySelector("ul.zg_hrsr li");
+          if (sub) {
+            const t = (sub.textContent || "").replace(/\s+/g, " ").trim();
+            const r2 = firstHashRank(t) || fallbackRankBeforeIn(t);
+            if (r2) res.rankingSecondary = r2;
+            const cat2 = cleanCategoryText(t);
+            if (cat2) res.secondaryCategory = cat2;
+          }
+        }
+      }
+
+      /* ------ Fallback: #productDetails_detailBullets_sections1 table ------ */
+      if (!(res.rankingMain && res.mainCategory)) {
+        const table = document.querySelector("#productDetails_detailBullets_sections1");
+        if (table) {
+          const rows = Array.from(table.querySelectorAll("tr"));
+          const bsrRow = rows.find(tr => {
+            const th = tr.querySelector("th");
+            if (!th) return false;
+            const t = (th.innerText || th.textContent || "").trim().toLowerCase();
+            return t.includes("best sellers rank");
+          });
+
+          if (bsrRow) {
+            const td = bsrRow.querySelector("td");
+            if (td) {
+              const lines = Array
+                .from(td.querySelectorAll("ul li span.a-list-item, ul li, span.a-list-item"))
+                .map(n => (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim())
+                .filter(Boolean);
+
+              const parseItem = (txt = "") => ({
+                rank: firstHashRank(txt) || fallbackRankBeforeIn(txt),
+                cat:  cleanCategoryText(txt)
+              });
+
+              if (lines[0]) {
+                const { rank, cat } = parseItem(lines[0]);
+                if (!res.rankingMain && rank) res.rankingMain = rank;
+                if (!res.mainCategory && cat) res.mainCategory = cat;
+              }
+              if (lines[1]) {
+                const { rank, cat } = parseItem(lines[1]);
+                if (!res.rankingSecondary && rank) res.rankingSecondary = rank;
+                if (!res.secondaryCategory && cat) res.secondaryCategory = cat;
+              }
+            }
+          }
+        }
       }
 
       return res;
@@ -760,8 +775,8 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   const map = {
     "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4",
     "⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
-    "₀":"0","₁":"1","₂":"2","₃":"3","⁴":"4",
-    "₅":"5","₆":"6","₇":"7","₈":"8","₉":"9",
+    "₀":"0","₁":"1","₂":"2","³":"3","⁴":"4",
+    "₅":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
   if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
@@ -828,8 +843,6 @@ app.get("/scrape", async (req, res) => {
   let browser, context, page;
   let detourBounceAttempts = 0;
   const MAX_DETOUR_BOUNCES = 3;
-
-  // detour counter callback for helpers
   const onDetour = () => { detourBounceAttempts++; };
 
   try {
@@ -838,37 +851,23 @@ app.get("/scrape", async (req, res) => {
     context = ctx.context;
     page = ctx.page;
 
-    // First nav (signal-based; detects late mission redirects)
-    await gotoAndDetectDetour(page, inputUrl, {
+    // First nav + recovery from mission interstitial (DOM-based)
+    await gotoAndRecoverMission(page, inputUrl, {
       timeout: 60000,
-      dpUrl: intendedDpUrl || undefined,
+      targetUrlAfterHome: intendedDpUrl || inputUrl,
       onDetour
     });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // Bounce back to dp if detoured (with homepage-hop for hz/mobile/mission)
+    // Bounce back to dp if later screens trigger mission again
     const bounceBackToDp = async () => {
       if (!intendedDpUrl) return;
       for (let i = 0; i < MAX_DETOUR_BOUNCES; i++) {
         if (await hasProductTitle(page) && isDpUrl(page.url())) break;
 
-        const curUrl = page.url();
-        if (isDpUrl(curUrl)) break;
-
-        if (isLikelyDetourUrl(curUrl)) {
+        if (await isMissionInterstitial(page)) {
           onDetour();
-          if (/\/hz\/mobile\/mission/i.test(curUrl)) {
-            try { await tryGoHomeViaLogo(page); } catch {}
-          }
-
-          await gotoAndDetectDetour(page, intendedDpUrl, {
-            timeout: 60000,
-            dpUrl: intendedDpUrl,
-            onDetour
-          });
-
-          page = await handleContinueShoppingFast(page, context, intendedDpUrl, onDetour);
-
+          await goHomeThenBack(page, intendedDpUrl);
           if (await hasProductTitle(page)) break;
         } else {
           break;
@@ -887,15 +886,7 @@ app.get("/scrape", async (req, res) => {
     if (!productLike) {
       if (intendedDpUrl && detourBounceAttempts < MAX_DETOUR_BOUNCES) {
         onDetour();
-        if (/\/hz\/mobile\/mission/i.test(page.url())) {
-          await tryGoHomeViaLogo(page).catch(() => {});
-        }
-        await gotoAndDetectDetour(page, intendedDpUrl, {
-          timeout: 60000,
-          dpUrl: intendedDpUrl,
-          onDetour
-        });
-        page = await handleContinueShoppingFast(page, context, intendedDpUrl, onDetour);
+        await goHomeThenBack(page, intendedDpUrl);
         productLike = await isProductPage(page);
       }
     }
@@ -931,6 +922,12 @@ app.get("/scrape", async (req, res) => {
         waitForNavSignals(page, { max: 6000 }),
         context.waitForEvent("page", { timeout: 6000 }).catch(() => null),
       ]);
+
+      if (await isMissionInterstitial(page)) {
+        onDetour();
+        await goHomeThenBack(page, intendedDpUrl || inputUrl);
+      }
+
       const after = page.url();
       if (await hasProductTitle(page)) break;
       if (after === before) await page.waitForTimeout(180).catch(() => {});
