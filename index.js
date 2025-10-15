@@ -667,11 +667,13 @@ async function scrapeProductData(page) {
         }
       }
 
-      /* ------ Fallback: broader product details table(s) ------ */
+      /* ------ Fallback: product details table (robust parsing per <li>) ------ */
       if (!(res.rankingMain && res.mainCategory)) {
-        const table = document.querySelector(
-          "#productDetails_detailBullets_sections1, #productDetails_techSpec_section_1, table.a-keyvalue.prodDetTable"
-        );
+        const table =
+          document.querySelector("#productDetails_detailBullets_sections1") ||
+          document.querySelector("#productDetails_techSpec_section_1") ||
+          document.querySelector("table.a-keyvalue.prodDetTable");
+
         if (table) {
           const rows = Array.from(table.querySelectorAll("tr"));
           const bsrRow = rows.find(tr => {
@@ -684,23 +686,42 @@ async function scrapeProductData(page) {
           if (bsrRow) {
             const td = bsrRow.querySelector("td");
             if (td) {
-              const lines = Array
-                .from(td.querySelectorAll("ul li span.a-list-item, ul li, span.a-list-item"))
-                .map(n => (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim())
-                .filter(Boolean);
+              const items = Array.from(td.querySelectorAll("ul li"));
+              const parseLi = (li) => {
+                const txtRaw = (li?.textContent || "").replace(/\s+/g, " ").trim();
 
-              const parseItem = (txt = "") => ({
-                rank: firstHashRank(txt) || fallbackRankBeforeIn(txt),
-                cat:  cleanCategoryText(txt)
-              });
+                // Rank: strictly after '#'
+                const rMatch = txtRaw.match(/#\s*([\d][\d,]*)/);
+                const rank = rMatch ? (rMatch[1] + "").replace(/[^\d]/g, "") : "";
 
-              if (lines[0]) {
-                const { rank, cat } = parseItem(lines[0]);
+                // Category: after ' in ' and before any '('
+                let afterIn = "";
+                const inIdx = txtRaw.toLowerCase().indexOf(" in ");
+                if (inIdx !== -1) {
+                  afterIn = txtRaw.slice(inIdx + 4);
+                }
+                let cat = afterIn ? afterIn.split("(")[0].trim() : "";
+
+                // If empty, try anchor text but ignore "See Top 100..." etc.
+                if (!cat) {
+                  const anchors = Array.from(li.querySelectorAll("a"));
+                  const a = anchors.find(a => !/see\s+top\s+100/i.test((a.textContent || "")));
+                  if (a) {
+                    cat = (a.textContent || "").replace(/\s+/g, " ").trim().split("(")[0].trim();
+                  }
+                }
+
+                return { rank, cat };
+              };
+
+              // First <li> → main, second <li> → secondary
+              if (items[0]) {
+                const { rank, cat } = parseLi(items[0]);
                 if (!res.rankingMain && rank) res.rankingMain = rank;
                 if (!res.mainCategory && cat) res.mainCategory = cat;
               }
-              if (lines[1]) {
-                const { rank, cat } = parseItem(lines[1]);
+              if (items[1]) {
+                const { rank, cat } = parseLi(items[1]);
                 if (!res.rankingSecondary && rank) res.rankingSecondary = rank;
                 if (!res.secondaryCategory && cat) res.secondaryCategory = cat;
               }
@@ -830,7 +851,7 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
     "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4",
     "⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
     "₀":"0","₁":"1","₂":"2","₃":"3","⁴":"4",
-    "₅":"5","₆":"6","₇":"7","⁸":"8","₉":"9",
+    "₅":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
   if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
