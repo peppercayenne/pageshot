@@ -745,7 +745,7 @@ async function scrapeProductData(page) {
       const urls = new Set();
       for (const s of scripts) {
         const txt = s.textContent || "";
-               if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
+        if (!/register\(["']ImageBlockATF["']/.test(txt)) continue;
         const objRe = /{\s*[^{}]*?"hiRes"\s*:\s*(?:["'](https?:[^"']+)["']|null)[\s\S]*?"large"\s*:\s*["'](https?:[^"']+)["'][\s\S]*?}/gi;
         let m;
         while ((m = objRe.exec(txt)) !== null) {
@@ -863,8 +863,15 @@ Rules:
   }
 }
 
-/* -------------------------- One-shot scrape helper ------------------------ */
-async function scrapeOnce(inputUrl) {
+/* -------------------------------- Endpoint -------------------------------- */
+app.get("/", (req, res) => {
+  res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
+});
+
+app.get("/scrape", async (req, res) => {
+  const inputUrl = req.query.url;
+  if (!inputUrl) return res.status(400).json({ ok: false, error: "Missing url param" });
+
   const width = 1280, height = 800;
   const asin = extractASINFromUrl(inputUrl);
   const intendedDpUrl = buildDpUrl(asin);
@@ -873,6 +880,7 @@ async function scrapeOnce(inputUrl) {
   let browser, context, page;
   let detourBounceAttempts = 0;
   const MAX_DETOUR_BOUNCES = 3;
+
   const onDetour = () => { detourBounceAttempts++; };
 
   try {
@@ -983,16 +991,13 @@ async function scrapeOnce(inputUrl) {
         }
       }
       const base64NP = bufNP.toString("base64");
-      return {
+      return res.json({
         ok: true,
-        data: {
-          ok: true,
-          url: page.url() || returnUrl,
-          pageType: "nonProduct",
-          detourBounceAttempts,
-          screenshot: base64NP,
-        },
-      };
+        url: page.url() || returnUrl,
+        pageType: "nonProduct",
+        detourBounceAttempts,
+        screenshot: base64NP,
+      });
     }
 
     // Quick settle: if the title is visible, continue immediately
@@ -1035,8 +1040,8 @@ async function scrapeOnce(inputUrl) {
     const resolvedUrl = page.url() || returnUrl;
     const finalAsin = extractASINFromUrl(resolvedUrl) || extractASINFromUrl(inputUrl);
 
-    // Build result JSON
-    const payload = {
+    // Final JSON
+    res.json({
       ok: true,
       url: resolvedUrl,
       pageType: "product",
@@ -1061,11 +1066,9 @@ async function scrapeOnce(inputUrl) {
 
       screenshot: base64,
       detourBounceAttempts,
-    };
-
-    return { ok: true, data: payload };
+    });
   } catch (err) {
-    return { ok: false, error: err?.message || String(err) };
+    res.status(500).json({ ok: false, error: err?.message || String(err) });
   } finally {
     try {
       for (const p of context?.pages?.() || []) {
@@ -1074,45 +1077,6 @@ async function scrapeOnce(inputUrl) {
     } catch {}
     try { await browser?.close(); } catch {}
   }
-}
-
-/* -------------------------------- Endpoint -------------------------------- */
-app.get("/", (req, res) => {
-  res.send("✅ Amazon scraper with Playwright + Gemini OCR is up.");
-});
-
-app.get("/scrape", async (req, res) => {
-  const inputUrl = req.query.url;
-  if (!inputUrl) return res.status(400).json({ ok: false, error: "Missing url param" });
-
-  // Server-side retry/backoff specifically for CAPTCHA/anti-bot blocks
-  const MAX_TRIES = 3;
-  const BASE_DELAY_MS = 1500;
-
-  let lastErrMsg = "Unknown error";
-  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
-    const result = await scrapeOnce(inputUrl);
-
-    if (result.ok) {
-      return res.json(result.data);
-    }
-
-    // Save error and decide whether to retry
-    lastErrMsg = result.error || "Unknown error";
-    const isCaptcha = /Blocked by Amazon CAPTCHA\/anti-bot/i.test(lastErrMsg);
-
-    if (isCaptcha && attempt < MAX_TRIES) {
-      // Exponential backoff with jitter
-      const wait = BASE_DELAY_MS * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 400);
-      await sleep(wait);
-      continue;
-    }
-
-    // Non-CAPTCHA error, or out of retries
-    break;
-  }
-
-  return res.status(500).json({ ok: false, error: lastErrMsg });
 });
 
 // Start server
