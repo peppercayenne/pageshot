@@ -651,7 +651,7 @@ async function scrapeProductData(page) {
         }
       }
 
-      // Fallback: product details table
+      // Fallback: product details table — parse UL > LI items precisely
       if (!(res.rankingMain && res.mainCategory)) {
         const table = document.querySelector("#productDetails_detailBullets_sections1");
         if (table) {
@@ -666,23 +666,27 @@ async function scrapeProductData(page) {
           if (bsrRow) {
             const td = bsrRow.querySelector("td");
             if (td) {
-              const lines = Array
-                .from(td.querySelectorAll("ul li span.a-list-item, ul li, span.a-list-item"))
-                .map(n => (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim())
-                .filter(Boolean);
+              // Prefer the top-level UL, then take only its direct LI children (no nested span flattening)
+              const ul = td.querySelector("ul.a-unordered-list") || td.querySelector("ul");
+              const liNodes = ul
+                ? Array.from(ul.children).filter(n => n && n.tagName && n.tagName.toLowerCase() === "li")
+                : [];
+
+              const getText = (el) => ((el?.innerText || el?.textContent || "") + "").replace(/\s+/g, " ").trim();
 
               const parseItem = (txt = "") => ({
                 rank: firstHashRank(txt) || fallbackRankBeforeIn(txt),
                 cat:  cleanCategoryText(txt)
               });
 
-              if (lines[0]) {
-                const { rank, cat } = parseItem(lines[0]);
+              // LI[0] => main; LI[1] => secondary (if present)
+              if (liNodes[0]) {
+                const { rank, cat } = parseItem(getText(liNodes[0]));
                 if (!res.rankingMain && rank) res.rankingMain = rank;
                 if (!res.mainCategory && cat) res.mainCategory = cat;
               }
-              if (lines[1]) {
-                const { rank, cat } = parseItem(lines[1]);
+              if (liNodes[1]) {
+                const { rank, cat } = parseItem(getText(liNodes[1]));
                 if (!res.rankingSecondary && rank) res.rankingSecondary = rank;
                 if (!res.secondaryCategory && cat) res.secondaryCategory = cat;
               }
@@ -808,7 +812,7 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
   const map = {
     "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4",
     "⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
-    "₀":"0","₁":"1","₂":"2","₃":"3","⁴":"4",
+    "₀":"0","₁":"1","₂":"2","³":"3","⁴":"4",
     "₅":"5","₆":"6","₇":"7","₈":"8","₉":"9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
