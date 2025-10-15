@@ -123,9 +123,9 @@ async function looksBlocked(page) {
 
 /* ------------------------- Signal-based wait helpers ----------------------- */
 async function settledUrl(page, {
-  dcl = 8000,      // cap for DOMContentLoaded
-  idle = 2000,     // cap for network idle
-  titleCap = 1200, // cap for fast '#productTitle' signal
+  dcl = 8000,
+  idle = 2000,
+  titleCap = 1200,
 } = {}) {
   await Promise.race([
     page.waitForLoadState("domcontentloaded", { timeout: dcl }).catch(() => {}),
@@ -163,8 +163,7 @@ async function waitForNavSignals(page, {
   await Promise.race(waiters);
 }
 
-/* ------------------- Mission (detour) detection & recovery ----------------- */
-// DOM-based detector (do NOT rely on URL)
+/* ---------------- Mission (detour) detection & recovery (DOM-only) --------- */
 async function isMissionDetour(page) {
   try {
     return await page.evaluate(() => !!document.getElementById("mission-page-first-page-element"));
@@ -173,8 +172,25 @@ async function isMissionDetour(page) {
   }
 }
 
-// Try to hop to homepage via logo; if that fails, hard-nav to /ref=nav_logo
+async function waitForHomepage(page, timeout = 8000) {
+  const start = Date.now();
+  while (Date.now() - start < timeout) {
+    const ok = await page.evaluate(() => {
+      if (document.getElementById("mission-page-first-page-element")) return false;
+      return !!(
+        document.querySelector("#twotabsearchtextbox") ||
+        document.querySelector("#gw-content-grid") ||
+        document.querySelector("#nav-logo-sprites")
+      );
+    }).catch(() => false);
+    if (ok) return true;
+    await page.waitForTimeout(150);
+  }
+  return false;
+}
+
 async function goHomeViaLogoOrDirect(page) {
+  // Try logo click first
   try {
     const logo = page.locator('a#nav-logo-sprites[href="/ref=nav_logo"], a#nav-logo-sprites').first();
     if (await logo.isVisible({ timeout: 800 }).catch(() => false)) {
@@ -184,34 +200,31 @@ async function goHomeViaLogoOrDirect(page) {
         page.waitForNavigation({ waitUntil: "commit", timeout: 6000 }).catch(() => null),
         page.waitForLoadState("domcontentloaded", { timeout: 6000 }).catch(() => null),
       ]);
+      if (await waitForHomepage(page, 6000)) return true;
       const after = page.url();
       if (after !== before) return true;
     }
   } catch {}
-  // Fallback: direct homepage
+  // Hard nav to homepage
   try {
     await page.goto("https://www.amazon.com/ref=nav_logo", { waitUntil: "commit", timeout: 30000 });
     await waitForNavSignals(page, { max: 6000 });
+    await waitForHomepage(page, 6000);
     return true;
   } catch {
     return false;
   }
 }
 
-// Full recovery loop: Home → back to intended DP URL
 async function recoverFromMissionDetour(page, {
   dpUrl,
-  maxTries = 2,
-  onDetour, // increments detourBounceAttempts
+  maxTries = 3,
+  onDetour,
 }) {
   for (let i = 0; i < maxTries; i++) {
-    if (!(await isMissionDetour(page))) return; // already fine
+    if (!(await isMissionDetour(page))) return;
     onDetour?.();
-
-    // Home hop
     await goHomeViaLogoOrDirect(page);
-
-    // Back to intended DP
     if (dpUrl) {
       try {
         await page.goto(dpUrl, { waitUntil: "commit", timeout: 60000 });
@@ -219,34 +232,12 @@ async function recoverFromMissionDetour(page, {
         await settledUrl(page);
       } catch {}
     }
-
-    // If still on mission, loop again
     if (!(await isMissionDetour(page))) return;
-    await sleep(jitter(150, 250));
+    await sleep(jitter(120, 240));
   }
 }
 
-/* ---------------------------- Navigation helpers -------------------------- */
-async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
-  let attempt = 0;
-  let lastErr;
-  while (attempt <= retries) {
-    try {
-      await page.goto(url, { timeout, waitUntil: "commit" });
-      await waitForNavSignals(page, { max: 6000 });
-      await settledUrl(page);
-      if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
-      return;
-    } catch (err) {
-      lastErr = err;
-      if (page.isClosed()) throw lastErr;
-      attempt++;
-    }
-  }
-  throw lastErr || new Error("Navigation failed");
-}
-
-/* ---------------------- Continue shopping helpers (kept) ------------------- */
+/* ---------------------- Continue shopping helpers (robust) ----------------- */
 async function closeAttachSideSheetIfVisible(page) {
   try {
     const closed = await page.evaluate(() => {
@@ -329,6 +320,66 @@ async function clickContinueShoppingIfPresent(page) {
   return false;
 }
 
+// Detect “blank DP + continue shopping UI” (no title/nav/ctas)
+async function isLikelyContinueShoppingOverlay(page) {
+  try {
+    return await page.evaluate(() => {
+      const hasTitle = !!(document.querySelector("#productTitle") || document.querySelector("#titleSection #title"));
+      const hasNav = !!document.querySelector("#nav-logo-sprites");
+      const bodyText = (document.body?.innerText || "").toLowerCase();
+      const hasPrompt = bodyText.includes("continue shopping") || bodyText.includes("keep shopping");
+      const hasBuy = !!(document.querySelector("#add-to-cart-button") || document.querySelector("#buy-now-button"));
+      return !hasTitle && !hasNav && hasPrompt && !hasBuy;
+    });
+  } catch {
+    return false;
+  }
+}
+
+async function emergencyCloseOverlays(page) {
+  try {
+    await page.keyboard.press("Escape").catch(() => {});
+    await page.keyboard.press("Escape").catch(() => {});
+  } catch {}
+
+  try {
+    await page.evaluate(() => {
+      const kill = (sel) => {
+        document.querySelectorAll(sel).forEach((n) => n.remove());
+      };
+      // Common Amazon overlay/popover/backdrop containers
+      kill(".a-modal-scroller");
+      kill(".a-popover-wrapper");
+      kill(".a-declarative.a-popover-open");
+      kill("#attach-desktop-sideSheet");
+      kill("#attach-accessory-pane");
+      kill("#nav-flyout-iss");
+      kill('div[role="dialog"]');
+      document.body.style.overflow = "auto";
+    });
+  } catch {}
+}
+
+/* ---------------------------- Navigation helpers -------------------------- */
+async function safeGoto(page, url, { retries = 2, timeout = 60000 } = {}) {
+  let attempt = 0;
+  let lastErr;
+  while (attempt <= retries) {
+    try {
+      await page.goto(url, { timeout, waitUntil: "commit" });
+      await waitForNavSignals(page, { max: 6000 });
+      await settledUrl(page);
+      if (await looksBlocked(page)) throw new Error("Blocked by Amazon CAPTCHA/anti-bot");
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (page.isClosed()) throw lastErr;
+      attempt++;
+    }
+  }
+  throw lastErr || new Error("Navigation failed");
+}
+
 async function hasProductTitle(page) {
   try {
     const ok = await page.locator("#productTitle, #title").first().isVisible({ timeout: 400 }).catch(() => false);
@@ -340,10 +391,8 @@ async function hasProductTitle(page) {
 
 async function trySimpleContinueShoppingFallback(page, maxTries = 3, onClick) {
   for (let i = 0; i < maxTries; i++) {
-    let clicked = false;
     try {
       await page.click("text=Continue Shopping", { timeout: 1500 });
-      clicked = true;
       onClick?.();
     } catch {}
     await Promise.race([
@@ -417,8 +466,9 @@ async function scrapeProductData(page) {
       return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
     };
     const cleanCategoryText = (text = "") => {
-      const afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
-      return afterIn.split("(")[0].trim();
+      let afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
+      afterIn = afterIn.replace(/\([^)]*\)/g, ""); // strip (...)
+      return afterIn.split("|")[0].trim();
     };
 
     /* -------- Item Form -------- */
@@ -510,7 +560,7 @@ async function scrapeProductData(page) {
       return cleaned || "";
     })();
 
-    /* -------- Date First Available (detail bullets) — return ONLY the date -------- */
+    /* -------- Date First Available (detail bullets) — ONLY the date -------- */
     const dateFirstAvailable = (() => {
       const container = document.querySelector("#detailBullets_feature_div");
       if (!container) return "";
@@ -554,7 +604,6 @@ async function scrapeProductData(page) {
         secondaryCategory: ""
       };
 
-      /* helpers */
       const firstHashRank = (text = "") => {
         const m = (text || "").match(/#\s*([\d][\d,\s.]*)/);
         return m ? (m[1] + "").replace(/[^\d]/g, "") : "";
@@ -565,11 +614,11 @@ async function scrapeProductData(page) {
       };
       const cleanCategoryText = (text = "") => {
         let afterIn = (text || "").replace(/^.*?\bin\b\s*/i, "");
-        afterIn = afterIn.replace(/\([^)]*\)/g, ""); // strip (...) completely
+        afterIn = afterIn.replace(/\([^)]*\)/g, ""); // remove parenthesis content
         return afterIn.split("|")[0].trim();
       };
 
-      /* ---------- Primary source: #detailBullets_feature_div ---------- */
+      // Primary: detail bullets
       const container = document.querySelector("#detailBullets_feature_div");
       if (container) {
         const li = Array.from(container.querySelectorAll("li")).find((node) => {
@@ -602,7 +651,7 @@ async function scrapeProductData(page) {
         }
       }
 
-      /* ------ Fallback: #productDetails_detailBullets_sections1 table ------ */
+      // Fallback: product details table
       if (!(res.rankingMain && res.mainCategory)) {
         const table = document.querySelector("#productDetails_detailBullets_sections1");
         if (table) {
@@ -622,7 +671,6 @@ async function scrapeProductData(page) {
                 .map(n => (n.innerText || n.textContent || "").replace(/\s+/g, " ").trim())
                 .filter(Boolean);
 
-              // prefer the first two logical rank lines
               const parseItem = (txt = "") => ({
                 rank: firstHashRank(txt) || fallbackRankBeforeIn(txt),
                 cat:  cleanCategoryText(txt)
@@ -665,7 +713,7 @@ async function scrapeProductData(page) {
       return "";
     })();
 
-    /* -------- Main Image (unchanged) -------- */
+    /* -------- Main Image -------- */
     const mainImageUrl = (() => {
       const imgTag = document.querySelector("#landingImage") || document.querySelector("#imgTagWrapperId img");
       if (imgTag) return imgTag.getAttribute("src") || "";
@@ -674,7 +722,7 @@ async function scrapeProductData(page) {
     const normalizeImageUrl = (url) => (url ? url.replace(/\._[A-Z0-9_,]+\_\.jpg/i, ".jpg") : "");
     const normalizedMain = normalizeImageUrl((mainImageUrl || "").trim());
 
-    /* -------- Additional Images: ONLY ImageBlockATF -------- */
+    /* -------- Additional Images (ImageBlockATF) -------- */
     const additionalImageUrls = (() => {
       const scripts = Array.from(document.querySelectorAll("script"));
       const unescapeUrl = (u) =>
@@ -706,7 +754,6 @@ async function scrapeProductData(page) {
       return Array.from(urls).filter((u) => u !== normalizedMain);
     })();
 
-    // Final date: prefer Date First Available, else Release date
     const finalDateFirstAvailable = dateFirstAvailable || releaseDate || "";
 
     return {
@@ -721,13 +768,12 @@ async function scrapeProductData(page) {
       rating,
       dateFirstAvailable: finalDateFirstAvailable,
 
-      // Ranking fields (filled below)
+      // Rank fields (filled below)
       rankingMain: "",
       mainCategory: "",
       rankingSecondary: "",
       secondaryCategory: "",
 
-      // temp payload to pass ranking values out
       __rankingPayload: {
         rankingMain,
         mainCategory,
@@ -736,7 +782,6 @@ async function scrapeProductData(page) {
       }
     };
   }, title).then((res) => {
-    // normalize ranking fields to "Unspecified" where empty
     const p = res.__rankingPayload || {};
     res.rankingMain       = (p.rankingMain && String(p.rankingMain)) || "Unspecified";
     res.mainCategory      = (p.mainCategory && String(p.mainCategory).trim()) || "Unspecified";
@@ -764,7 +809,7 @@ function normalizeGeminiPrice(raw = "", domPrice = "") {
     "⁰":"0","¹":"1","²":"2","³":"3","⁴":"4",
     "⁵":"5","⁶":"6","⁷":"7","⁸":"8","⁹":"9",
     "₀":"0","₁":"1","₂":"2","₃":"3","⁴":"4",
-    "₅":"5","₆":"6","₇":"7","₈":"8","⁹":"9",
+    "₅":"5","₆":"6","₇":"7","₈":"8","₉":"9",
   };
   s = s.replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹₀-₉]/g, (ch) => map[ch] || ch);
   if (!/\d\.\d{2,}/.test(s) && /(\d+),(\d{2})\b/.test(s)) s = s.replace(/(\d+),(\d{2})\b/, "$1.$2");
@@ -840,30 +885,28 @@ app.get("/scrape", async (req, res) => {
     context = ctx.context;
     page = ctx.page;
 
-    // First nav
+    // First navigation
     await safeGoto(page, inputUrl, { retries: 2, timeout: 60000 });
     ensureAlive(page, "Page unexpectedly closed after navigation");
 
-    // NEW: Mission detour recovery (DOM-based) — early
+    // Early mission recovery if needed
     if (await isMissionDetour(page)) {
       await recoverFromMissionDetour(page, {
         dpUrl: intendedDpUrl || inputUrl,
-        maxTries: 2,
+        maxTries: 3,
         onDetour
       });
     }
 
-    // Bounce-back loop to DP if we later land on mission again
+    // Bounce-back loop if we get sent to mission again
     const bounceBackToDp = async () => {
       if (!intendedDpUrl) return;
       for (let i = 0; i < MAX_DETOUR_BOUNCES; i++) {
         if (await hasProductTitle(page) && isDpUrl(page.url())) break;
-
-        // If the mission UI is present, perform recovery
         if (await isMissionDetour(page)) {
           await recoverFromMissionDetour(page, {
             dpUrl: intendedDpUrl,
-            maxTries: 2,
+            maxTries: 3,
             onDetour
           });
           if (await hasProductTitle(page)) break;
@@ -874,19 +917,57 @@ app.get("/scrape", async (req, res) => {
     };
     await bounceBackToDp();
 
-    // If on /dp/ but no title yet, simple 'Continue shopping' fallback
-    if (isDpUrl(page.url()) && !(await hasProductTitle(page))) {
-      await trySimpleContinueShoppingFallback(page, 3, null);
+    // Continue Shopping overlay handling (robust path)
+    if (isDpUrl(page.url())) {
+      for (let cycle = 0; cycle < 4; cycle++) {
+        // If we have the overlay (blank dp), try to close it
+        if (await isLikelyContinueShoppingOverlay(page)) {
+          const clicked = await clickContinueShoppingIfPresent(page);
+          if (!clicked) {
+            await emergencyCloseOverlays(page);
+          }
+          await Promise.race([
+            waitForNavSignals(page, { max: 6000 }),
+            page.waitForTimeout(400).then(() => null),
+          ]);
+          // As a last resort, force-reload DP
+          if (!(await hasProductTitle(page))) {
+            try {
+              await page.goto(intendedDpUrl || inputUrl, { waitUntil: "commit" });
+              await waitForNavSignals(page, { max: 6000 });
+            } catch {}
+          }
+        } else {
+          // Try the softer fallback if no overlay signals but no title
+          if (!(await hasProductTitle(page))) {
+            const ok = await trySimpleContinueShoppingFallback(page, 2, null);
+            if (!ok) {
+              await emergencyCloseOverlays(page);
+              try {
+                await page.goto(intendedDpUrl || inputUrl, { waitUntil: "commit" });
+                await waitForNavSignals(page, { max: 6000 });
+              } catch {}
+            }
+          }
+        }
+        if (await hasProductTitle(page)) break;
+        if (await isMissionDetour(page)) {
+          await recoverFromMissionDetour(page, {
+            dpUrl: intendedDpUrl || inputUrl,
+            maxTries: 3,
+            onDetour
+          });
+        }
+      }
     }
 
-    // Final product check; if not product after bounces, return nonProduct JSON
+    // Final product check; if not product after all, return nonProduct JSON
     let productLike = await isProductPage(page);
     if (!productLike) {
-      // One more chance: recover in case mission overlay reappeared
       if (await isMissionDetour(page)) {
         await recoverFromMissionDetour(page, {
           dpUrl: intendedDpUrl || inputUrl,
-          maxTries: 2,
+          maxTries: 3,
           onDetour
         });
         productLike = await isProductPage(page);
@@ -913,28 +994,6 @@ app.get("/scrape", async (req, res) => {
         detourBounceAttempts,
         screenshot: base64NP,
       });
-    }
-
-    // Handle any “continue shopping” loops inline (fast-exit if title appears)
-    for (let i = 0; i < 3; i++) {
-      const before = page.url();
-      const handled = await clickContinueShoppingIfPresent(page);
-      if (!handled) break;
-      await Promise.race([
-        waitForNavSignals(page, { max: 6000 }),
-        context.waitForEvent("page", { timeout: 6000 }).catch(() => null),
-      ]);
-      const after = page.url();
-      if (await hasProductTitle(page)) break;
-      if (after === before) await page.waitForTimeout(180).catch(() => {});
-      // If a click throws us to mission UI, recover
-      if (await isMissionDetour(page)) {
-        await recoverFromMissionDetour(page, {
-          dpUrl: intendedDpUrl || inputUrl,
-          maxTries: 2,
-          onDetour
-        });
-      }
     }
 
     // Quick settle: if the title is visible, continue immediately
@@ -996,7 +1055,6 @@ app.get("/scrape", async (req, res) => {
       rating: scraped.rating || "Unspecified",
       dateFirstAvailable: scraped.dateFirstAvailable || "Unspecified",
 
-      // Ranking fields
       rankingMain: scraped.rankingMain || "Unspecified",
       mainCategory: scraped.mainCategory || "Unspecified",
       rankingSecondary: scraped.rankingSecondary || "Unspecified",
